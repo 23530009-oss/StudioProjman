@@ -1,0 +1,39 @@
+name: Studio Cloud Worker Engine
+
+on:
+  repository_dispatch:
+    types: [studio_cloud_task]
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: 'Studio Task ID'
+        required: false
+        default: 'test_task'
+
+jobs:
+  run_worker:
+    name: Run Studio Cloud Worker on Azure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 📦 Cache Pip Packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-cache-${{ runner.os }}-playwright
+
+      - name: ⚡ Fast Install Python Dependencies
+        run: |
+          pip install playwright cryptography
+
+      - name: 🚀 Execute Studio Cloud Worker
+        env:
+          MASTER_SALT: ${{ secrets.MASTER_SALT }}
+          FIREBASE_BASE_URL: ${{ secrets.FIREBASE_BASE_URL || secrets.FIREBASE_URL }}
+        run: |
+          TASK_ID="${{ github.event.client_payload.task_id || github.event.inputs.task_id || 'test_task' }}"
+          echo "Processing Studio Cloud Task ID: $TASK_ID"
+          python3 studio_cloud_worker.py "$TASK_ID"
