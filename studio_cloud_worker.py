@@ -1332,7 +1332,117 @@ def run_nightly_maintenance():
         f"Studio phones will operate 100% smoothly with zero PC uptime required!"
     )
     send_whatsapp_alert(summary_msg)
-    print("\n" + summary_msg)
+def run_attachment_safety_test(account_idx=14):
+    from playwright.sync_api import sync_playwright
+
+    print("=" * 65)
+    print(f"🔬 RUNNING LIVE CLOUD ATTACHMENT TEST ON AZURE (ACCOUNT #{account_idx + 1})")
+    print("🛑 STRICT SAFETY GUARD: SEND BUTTON WILL NEVER BE CLICKED!")
+    print("=" * 65)
+
+    raw_cookie = get_active_cookie(account_idx)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            channel="chrome",
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1280,850"
+            ]
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 850},
+            device_scale_factor=1,
+            locale="en-US",
+            timezone_id="Asia/Kathmandu"
+        )
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        inject_cookies_to_context(context, raw_cookie)
+        page = context.new_page()
+
+        print(f"🌍 [Azure Cloud] Navigating to ChatGPT with Account #{account_idx + 1}...")
+        t_nav = time.time()
+        page.goto("https://chatgpt.com", wait_until="domcontentloaded", timeout=45000)
+        time.sleep(2.0)
+
+        # Pre-flight auth check
+        auth_err = check_login_or_auth_expired(page)
+        if auth_err:
+            print(f"❌ Account #{account_idx + 1} session expired: {auth_err}")
+            browser.close()
+            return
+
+        # Dismiss popups
+        for btn_text in ["Stay logged out", "Dismiss", "Close", "Not now", "Got it", "Maybe later", "Okay", "Continue"]:
+            try:
+                b = page.locator(f'button:has-text("{btn_text}")').first
+                if b.count() > 0 and b.is_visible():
+                    b.click(timeout=1000)
+            except Exception:
+                pass
+
+        try:
+            page.wait_for_selector('#prompt-textarea, [contenteditable="true"]', timeout=25000)
+            print(f"✅ Composer loaded and ready on Azure runner in {time.time() - t_nav:.2f}s!")
+        except Exception as e:
+            print(f"❌ Composer not ready on Azure runner: {_safe_err(e)}")
+            browser.close()
+            return
+
+        # Create dummy portrait for upload test (standalone PNG without PIL)
+        temp_img_path = os.path.abspath(f"test_cloud_upload_{int(time.time())}.png")
+        tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAYAAACNMs+9AAAAFUlEQVR42mP8z8BQz0AEYBxVSF+FABJAD/sY6DDFAAAAAElFTkSuQmCC")
+        with open(temp_img_path, "wb") as f_img:
+            f_img.write(tiny_png)
+
+        try:
+            print(f"📤 Uploading test portrait to input[type='file'] on Azure...")
+            t_upload = time.time()
+            file_input = page.locator('input[type="file"]').first
+            file_input.wait_for(state="attached", timeout=15000)
+            file_input.set_input_files(temp_img_path)
+
+            # Monitor attachment confirmation
+            attached = False
+            for sec in range(1, 16):
+                time.sleep(1.0)
+                att_sel = 'button[aria-label*="Remove" i], div[data-testid*="attachment"], [class*="attachment"], [class*="thumbnail"]'
+                att_count = page.locator(att_sel).count()
+                if att_count > 0:
+                    print(f"🎉 [Azure Cloud] Attachment thumbnail CONFIRMED in {time.time() - t_upload:.2f}s! (Matched {att_count} elements)")
+                    attached = True
+                    break
+                else:
+                    print(f"   [{sec}s] Azure cloud runner waiting for OpenAI CDN attachment render...")
+
+            if not attached:
+                print(f"⚠️ Attachment confirmation took longer than 15s on Azure cloud runner.")
+            else:
+                print(f"✅ Verification Successful: Account #{account_idx + 1} accepts uploads smoothly on Azure Cloud!")
+
+            # Check send button state without clicking
+            send_sel = '[data-testid="send-button"], button[aria-label*="end prompt" i], button[aria-label*="end message" i], button[aria-label*="Send" i]'
+            send_btn = page.locator(send_sel).first
+            if send_btn.count() > 0:
+                is_disabled = send_btn.get_attribute("disabled") is not None or send_btn.get_attribute("aria-disabled") == "true"
+                print(f"🎯 Send button status on Azure: Available (Disabled={is_disabled})")
+
+            # Sync fresh rotated cookie
+            sync_fresh_cookies(page.context, account_idx)
+            print("🛑 STRICT SAFETY GUARANTEE: Send button was NOT clicked. ZERO quota was consumed.")
+        finally:
+            if os.path.exists(temp_img_path):
+                try:
+                    os.remove(temp_img_path)
+                except Exception:
+                    pass
+            browser.close()
+            print("🚪 Azure browser session closed cleanly.")
 
 
 if __name__ == "__main__":
@@ -1348,5 +1458,13 @@ if __name__ == "__main__":
 
     if target_task_id == "nightly_maintenance" or os.environ.get("RUN_MODE") == "NIGHTLY_MAINTENANCE":
         run_nightly_maintenance()
+    elif target_task_id.startswith("test_attach_") or target_task_id == "test_acc15_attachment":
+        acc_num = 14
+        if "_" in target_task_id:
+            try:
+                acc_num = int(target_task_id.split("_")[-1]) - 1
+            except Exception:
+                acc_num = 14
+        run_attachment_safety_test(acc_num)
     else:
         process_studio_task(target_task_id)
