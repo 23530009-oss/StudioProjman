@@ -326,6 +326,9 @@ def mark_account_rate_limited(account_idx, reset_time=None):
         if reset_time:
             patch_payload["resetTime"] = reset_time
             patch_payload["lastBlockedProbeTime"] = int(time.time() * 1000)
+        else:
+            patch_payload["resetTime"] = ""
+            patch_payload["lastBlockedProbeTime"] = int(time.time() * 1000)
 
         req = urllib.request.Request(
             acc_url,
@@ -683,11 +686,24 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         update_firebase_result(slot_id, "COMPLETED", image_b64=out_b64)
         update_slot_data(slot_id, {"status": "COMPLETED"})
         sync_fresh_cookies(page.context, account_idx)
+        # Clear any stale cooldown resetTime now that generation succeeded
+        try:
+            req_patch = urllib.request.Request(
+                f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json",
+                data=json.dumps({"resetTime": ""}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="PATCH"
+            )
+            urllib.request.urlopen(req_patch, timeout=5)
+        except Exception:
+            pass
         print(f"🎉 Slot {slot_id} completed successfully in {time.time() - t_start:.2f}s!")
         return True
     else:
         if is_rate_limit:
-            mark_account_rate_limited(account_idx)
+            time_match = re.search(r"(?:after|until)\s+([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM|am|pm)?)", assistant_text, re.IGNORECASE)
+            reset_time_str = time_match.group(1).strip() if time_match else None
+            mark_account_rate_limited(account_idx, reset_time_str)
             err = f"EXPLICIT_RATE_LIMIT: Account #{int(account_idx)+1}: {assistant_text[:120]}"
         elif is_auth_expired:
             mark_account_expired(account_idx)
