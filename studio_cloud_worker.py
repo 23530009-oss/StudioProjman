@@ -106,7 +106,11 @@ def decrypt_data_aes(enc_b64):
     return decrypted.decode("utf-8")
 
 
+_POOL_TIMESTAMP_MS = 0
+
+
 def get_decrypted_pool():
+    global _POOL_TIMESTAMP_MS
     req = urllib.request.Request(FIREBASE_COOKIE_URL, headers={"User-Agent": "StudioCloudWorker"})
     with urllib.request.urlopen(req, timeout=10) as r:
         data = json.loads(r.read().decode("utf-8"))
@@ -114,6 +118,7 @@ def get_decrypted_pool():
     enc = data.get("enc", "")
     decrypted = decrypt_data_aes(enc)
     parsed = json.loads(decrypted)
+    _POOL_TIMESTAMP_MS = int(parsed.get("timestamp_ms", 0))
 
     accounts = parsed.get("accounts", [])
     if not accounts:
@@ -222,14 +227,21 @@ def get_active_cookie(account_idx=None):
 
     # 1. Check for fresh rotated cookie in Firebase status
     try:
-        req_fresh = urllib.request.Request(f"{FIREBASE_STATUS_BASE}/acc_{idx}/freshCookie.json", headers={"User-Agent": "StudioCloudWorker"})
+        req_fresh = urllib.request.Request(f"{FIREBASE_STATUS_BASE}/acc_{idx}.json", headers={"User-Agent": "StudioCloudWorker"})
         with urllib.request.urlopen(req_fresh, timeout=5) as resp:
-            fresh_enc = json.loads(resp.read().decode("utf-8"))
-            if fresh_enc and isinstance(fresh_enc, str) and len(fresh_enc) > 30:
+            stat_obj = json.loads(resp.read().decode("utf-8")) or {}
+            fresh_enc = stat_obj.get("freshCookie", "")
+            last_sync = int(stat_obj.get("lastCookieSync", 0))
+
+            # CRITICAL GUARD: Only use freshCookie if it was synced AFTER the last PC harvest!
+            # If the pool in cookie_pool.json was updated more recently on PC, the pool cookie is newer!
+            if fresh_enc and isinstance(fresh_enc, str) and len(fresh_enc) > 30 and (last_sync >= _POOL_TIMESTAMP_MS):
                 decrypted = decrypt_data_aes(fresh_enc)
                 if decrypted and ("session-token" in decrypted or "oai-did" in decrypted):
-                    print(f"🎯 Assigned Account #{idx + 1} (Using Fresh Synced Cookie 🔄)")
+                    print(f"🎯 Assigned Account #{idx + 1} (Using Fresh Synced Cookie 🔄, synced: {last_sync})")
                     return decrypted
+            elif fresh_enc and last_sync < _POOL_TIMESTAMP_MS:
+                print(f"ℹ️ Account #{idx + 1} freshCookie is older than PC harvest ({last_sync} < {_POOL_TIMESTAMP_MS}). Prioritizing PC harvest cookie! 📦")
     except Exception as e_fresh:
         print(f"ℹ️ Account #{idx + 1} fresh cookie check fallback: {_safe_err(e_fresh)}")
 
@@ -454,12 +466,12 @@ def mark_account_expired(account_idx):
         expire_url = f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json"
         req = urllib.request.Request(
             expire_url,
-            data=json.dumps({"isExpired": True, "bookedBy": "", "bookedUntil": 0}).encode("utf-8"),
+            data=json.dumps({"isExpired": True, "bookedBy": "", "bookedUntil": 0, "freshCookie": "", "lastCookieSync": 0}).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="PATCH"
         )
         urllib.request.urlopen(req, timeout=5)
-        print(f"⚠️ Marked account #{int(account_idx)+1} as isExpired in Firebase pool.")
+        print(f"⚠️ Marked account #{int(account_idx)+1} as isExpired (cleared freshCookie cache) in Firebase pool.")
 
         # Dispatch instant WhatsApp alert directly from Cloud VM
         acc_num = f"#{int(account_idx)+1}"
@@ -1276,6 +1288,28 @@ def process_studio_task(slot_id):
         auth_err = check_login_or_auth_expired(page)
         switched_from = None
         switch_reason = None
+        if auth_err:
+            baseline_cookie = accounts[account_idx].get("cookie", "")
+            # If we were using a freshCookie and it failed, retry with newly harvested pool baseline cookie!
+            if raw_cookie != baseline_cookie and baseline_cookie:
+                print(f"⚠️ Account #{account_idx + 1} fresh rotated cookie failed: {auth_err}. Retrying with newly harvested pool baseline cookie...")
+                context.clear_cookies()
+                inject_cookies_to_context(context, baseline_cookie)
+                page.goto("https://chatgpt.com", wait_until="domcontentloaded", timeout=45000)
+                time.sleep(1.5)
+                auth_err = check_login_or_auth_expired(page)
+                if not auth_err:
+                    print(f"✅ Account #{account_idx + 1} succeeded with pool baseline cookie! Clearing obsolete freshCookie cache.")
+                    try:
+                        urllib.request.urlopen(urllib.request.Request(
+                            f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json",
+                            data=json.dumps({"freshCookie": "", "lastCookieSync": 0}).encode("utf-8"),
+                            headers={"Content-Type": "application/json"},
+                            method="PATCH"
+                        ), timeout=5)
+                    except Exception:
+                        pass
+
         if auth_err:
             print(f"⚠️ Pre-flight detected session expiry on Account #{account_idx + 1}: {auth_err}")
             mark_account_expired(account_idx)
