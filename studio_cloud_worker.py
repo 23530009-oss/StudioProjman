@@ -694,7 +694,7 @@ def find_and_lock_next_account(slot_id, exclude_indices=None, device_id=""):
         if chosen_idx is not None:
             atomic_lock_account(chosen_idx, slot_id, device_id)
             print(f"✅ Self-Healing: Switched to Account #{chosen_idx + 1}")
-            return chosen_idx, accounts[chosen_idx].get("cookie", "")
+            return chosen_idx, get_active_cookie(chosen_idx)
     except Exception as e:
         print(f"❌ Self-Healing error: {_safe_err(e)}")
 
