@@ -1289,7 +1289,11 @@ def process_studio_task(slot_id):
         switched_from = None
         switch_reason = None
         if auth_err:
-            baseline_cookie = accounts[account_idx].get("cookie", "")
+            try:
+                pool_accs = get_decrypted_pool()
+                baseline_cookie = pool_accs[account_idx].get("cookie", "") if account_idx < len(pool_accs) else ""
+            except Exception:
+                baseline_cookie = ""
             # If we were using a freshCookie and it failed, retry with newly harvested pool baseline cookie!
             if raw_cookie != baseline_cookie and baseline_cookie:
                 print(f"⚠️ Account #{account_idx + 1} fresh rotated cookie failed: {auth_err}. Retrying with newly harvested pool baseline cookie...")
@@ -1422,12 +1426,27 @@ def process_studio_task(slot_id):
 
                 print(f"📋 Account #{account_idx + 1} Plus Menu Text: {repr(parent_text)}")
 
-                # Resilient check: Only check for the genuine blocking pattern
-                is_blocked = ("0 images left" in parent_text.lower()) or ("images left until" in parent_text.lower())
+                # Dynamic, resilient quota parse (guards against false alarm when 1, 2, or 3 images remain!)
+                p_lower = parent_text.lower()
+                explicit_zero = any(k in p_lower for k in ["0 images left", "0 left", "no images left", "zero images left"])
+                left_match = re.search(r"(\d+)\s*(?:images?)?\s*left", p_lower)
+                time_match = re.search(r"until\s+([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM|am|pm)?)", parent_text, re.IGNORECASE)
+                reset_time_str = time_match.group(1).strip() if time_match else ""
+
+                if explicit_zero:
+                    is_blocked = True
+                    remaining_detected = 0
+                elif left_match:
+                    remaining_detected = int(left_match.group(1))
+                    is_blocked = (remaining_detected == 0)
+                elif reset_time_str and any(k in p_lower for k in ["limit", "quota", "reached", "exceeded"]):
+                    is_blocked = True
+                    remaining_detected = 0
+                else:
+                    is_blocked = False
+                    remaining_detected = None
 
                 if is_blocked:
-                    time_match = re.search(r"until\s+([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM|am|pm)?)", parent_text, re.IGNORECASE)
-                    reset_time_str = time_match.group(1).strip() if time_match else ""
                     print(f"🔒 Account #{account_idx + 1} confirmed blocked by OpenAI until: {reset_time_str or 'Unknown'}")
                     mark_account_rate_limited(account_idx, reset_time_str)
                     atomic_unlock_account(account_idx, slot_id)
@@ -1443,8 +1462,8 @@ def process_studio_task(slot_id):
                         f"Quota confirmed at 0. Studio apps will automatically use next available account."
                     )
                 else:
-                    # Not blocked! Award +1 bonus image
-                    print(f"🎉 Account #{account_idx + 1} is NOT blocked by OpenAI! Awarding bonus image...")
+                    # Not blocked! Calculate accurate usage based on dynamic remaining count
+                    print(f"🎉 Account #{account_idx + 1} is NOT blocked by OpenAI! Restoring quota...")
                     cur_stat = {}
                     max_images = 3
                     try:
@@ -1456,7 +1475,11 @@ def process_studio_task(slot_id):
                     except Exception:
                         pass
                     cur_usage = int(cur_stat.get("usage", max_images))
-                    new_usage = max(0, cur_usage - 1)
+                    if remaining_detected is not None and remaining_detected > 0:
+                        new_usage = max(0, max_images - remaining_detected)
+                        print(f"📊 Dynamically calibrated usage from menu text: {remaining_detected}/{max_images} remaining -> usage set to {new_usage}")
+                    else:
+                        new_usage = max(0, cur_usage - 1)
                     bonus_patch = {
                         "usage": new_usage,
                         "bookedBy": "",
