@@ -822,13 +822,13 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
     # Ensure image attachment preview appears
     attached_ok = False
-    for _ in range(30):
-        time.sleep(1.0)
+    for _ in range(40):
         attach_preview = page.locator('div[data-testid*="attachment"], div[class*="attachment"], button[aria-label*="Remove"], [class*="thumbnail"], [data-testid*="image"]')
         if attach_preview.count() > 0 and any(attach_preview.nth(i).is_visible() for i in range(attach_preview.count())):
             attached_ok = True
             photo_uploaded = True
             break
+        time.sleep(0.4)
 
     if not attached_ok:
         err = "TRANSIENT_TIMEOUT: Image attachment confirmation timed out (aborted to prevent text hallucination)"
@@ -848,10 +848,10 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     send_btn = page.locator('button[data-testid="send-button"]').first
     try:
         send_btn.wait_for(state="visible", timeout=8000)
-        for _ in range(10):
+        for _ in range(25):
             if send_btn.is_enabled():
                 break
-            time.sleep(1.0)
+            time.sleep(0.3)
 
         if send_btn.is_enabled():
             send_btn.click(force=True, timeout=3000)
@@ -918,6 +918,34 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
             if generated_img_bytes:
                 break
+
+        # ⚡ FAST-BREAK: Check for rate-limit / auth-expired text in assistant messages (<3s instead of 90s!)
+        if (time.time() - gen_start) > 2.0 and not generated_img_bytes:
+            try:
+                msgs = page.locator('div[data-message-author-role="assistant"]').all_inner_texts()
+                if msgs:
+                    combined_txt = " ".join(msgs).strip().lower()
+                    if len(combined_txt) > 5:
+                        rl_words = [
+                            "reached our limit", "reached the limit", "reached your limit",
+                            "image creation limit", "image generation limit", "hit a limit",
+                            "hit the limit", "too many requests", "try again after",
+                            "try again in", "wait until", "free plan limit", "daily limit", "quota exceeded"
+                        ]
+                        if any(w in combined_txt for w in rl_words):
+                            print(f"⚡ Early Rate Limit Detected in {time.time() - gen_start:.1f}s! Aborting 90s wait loop immediately.")
+                            is_rate_limit = True
+                            assistant_text = combined_txt
+                            break
+
+                        auth_words = ["require you to log in", "requires you to log in", "please log in", "sign in to create", "session has expired"]
+                        if any(w in combined_txt for w in auth_words):
+                            print(f"⚡ Early Auth Expiry Detected in {time.time() - gen_start:.1f}s! Aborting 90s wait loop immediately.")
+                            is_auth_expired = True
+                            assistant_text = combined_txt
+                            break
+            except Exception:
+                pass
 
         stop_btn = page.locator('button[data-testid="stop-button"]')
         if stop_btn.count() == 0 and (time.time() - gen_start) > 8 and images and generated_img_bytes:
@@ -1008,6 +1036,52 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         print(f"🎉 Slot {_mask_task(slot_id)} completed successfully in {time.time() - t_start:.2f}s!")
         return True
     else:
+        # 🚀 IN-FLIGHT LIVE HOT-SWAP: If rate-limited or auth-expired, swap to next account and retry in same session!
+        if (is_rate_limit or is_auth_expired) and switched_from is None:
+            if is_rate_limit:
+                time_match = re.search(r"(?:after|until|at|around)\s+([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM|am|pm)?)", assistant_text, re.IGNORECASE)
+                reset_time_str = time_match.group(1).strip() if time_match else None
+                mark_account_rate_limited(account_idx, reset_time_str)
+                err = f"EXPLICIT_RATE_LIMIT: Account #{int(account_idx)+1}: {assistant_text[:120]}"
+            else:
+                mark_account_expired(account_idx)
+                err = f"EXPLICIT_AUTH_EXPIRED: Account #{int(account_idx)+1} requires login: {assistant_text[:120]}"
+
+            print(f"⚠️ {err}")
+            atomic_unlock_account(account_idx, slot_id)
+            print(f"⚡ In-Flight Hot-Swap: Querying next eligible account from pool for {_mask_task(slot_id)}...")
+            old_idx = account_idx
+            new_idx, new_cookie = find_and_lock_next_account(slot_id, exclude_indices=[account_idx], device_id=device_id)
+            if new_idx is not None and new_cookie:
+                print(f"🚀 In-Flight Hot-Swap Success: Instantly switched to Account #{new_idx+1}!")
+                switched_from = old_idx
+                switch_reason = "Rate Limit Redirect" if is_rate_limit else "Auth Expired Redirect"
+                account_idx = new_idx
+                update_slot_data(slot_id, {
+                    "accountIndex": account_idx,
+                    "switchedFrom": switched_from,
+                    "switchReason": switch_reason
+                })
+                try:
+                    page.context.clear_cookies()
+                    inject_cookies_to_context(page.context, new_cookie)
+                    page.goto("https://chatgpt.com", wait_until="domcontentloaded", timeout=45000)
+                    time.sleep(1.0)
+                    for btn_text in ["Stay logged out", "Dismiss", "Close", "Not now", "Got it", "Maybe later", "Okay", "Continue"]:
+                        btn = page.locator(f'button:has-text("{btn_text}")').first
+                        if btn.count() > 0 and btn.is_visible():
+                            btn.click(timeout=1000)
+
+                    # Seamless in-flight retry on fresh account!
+                    return execute_chatgpt_generation(
+                        page, slot_id, account_idx, prompt, img_b64, t_start,
+                        device_id=device_id,
+                        switched_from=switched_from,
+                        switch_reason=switch_reason
+                    )
+                except Exception as ex_swap:
+                    print(f"⚠️ In-flight swap re-execution failed: {_safe_err(ex_swap)}")
+
         if is_rate_limit:
             time_match = re.search(r"(?:after|until|at|around)\s+([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM|am|pm)?)", assistant_text, re.IGNORECASE)
             reset_time_str = time_match.group(1).strip() if time_match else None
