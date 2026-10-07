@@ -1,0 +1,41 @@
+name: Studio Autonomous Nightly Maintenance Cron
+
+on:
+  schedule:
+    # 02:03 AM Nepal Time (UTC+5:45) is 20:18 UTC (off-peak to bypass global GitHub queue)
+    - cron: '18 20 * * *'  # 02:03 AM Nepal Time (UTC+5:45) off-peak minute to bypass runner queue
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual maintenance trigger'
+        required: false
+        default: 'Manual Keep-Alive & Selector Sync'
+
+jobs:
+  nightly_keepalive:
+    name: Nightly ChatGPT Token Keep-Alive & Selector Sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 📦 Cache Pip Packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-cache-${{ runner.os }}-playwright
+
+      - name: ⚡ Fast Install Python Dependencies
+        run: |
+          pip install playwright cryptography
+
+      - name: 🚀 Execute Studio Nightly Maintenance
+        env:
+          MASTER_SALT: ${{ secrets.MASTER_SALT }}
+          FIREBASE_BASE_URL: ${{ secrets.FIREBASE_BASE_URL || secrets.FIREBASE_URL }}
+          FIREBASE_AUTH_TOKEN: ${{ secrets.FIREBASE_AUTH_TOKEN }}
+        run: |
+          echo "Starting Autonomous Nightly Maintenance at $(date)"
+          python3 studio_cloud_worker.py "nightly_maintenance"
