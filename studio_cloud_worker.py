@@ -1677,27 +1677,27 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     ).first
     composer_ready = False
     try:
-        composer.wait_for(state="visible", timeout=35000)
+        composer.wait_for(state="visible", timeout=18000)
         composer_ready = True
     except Exception:
         # Retry with reload once if stuck
         try:
-            print(f"⚠️ Composer not visible in 35s on Account #{int(account_idx)+1}. Reloading page once...")
-            page.reload(wait_until="domcontentloaded", timeout=20000)
-            time.sleep(2.0)
+            print(f"⚠️ Composer not visible in 18s on Account #{int(account_idx)+1}. Reloading page once...")
+            page.reload(wait_until="domcontentloaded", timeout=15000)
+            time.sleep(1.5)
             composer = page.locator(
                 'div[data-testid="composer-input"]:visible, '
                 'div[contenteditable="true"]:visible, '
                 'textarea[data-testid="composer-input"]:visible, '
                 'textarea:visible'
             ).first
-            composer.wait_for(state="visible", timeout=15000)
+            composer.wait_for(state="visible", timeout=10000)
             composer_ready = True
         except Exception:
             pass
 
     if not composer_ready:
-        err = f"STUDIO_ENGINE_TIMEOUT: Processing node not ready within 50s (Slot #{int(account_idx)+1})"
+        err = f"STUDIO_ENGINE_TIMEOUT: Processing node not ready within 28s (Slot #{int(account_idx)+1})"
         print(f"❌ {err}")
         update_firebase_result(slot_id, "FAILED", error=err, account_idx=account_idx, engine="STUDIO_TURBO")
         update_slot_data(slot_id, {"status": "FAILED"})
@@ -1843,7 +1843,7 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     # 5. Monitor Generation & Detect Result Image
     generated_img_url = None
     generated_img_bytes = None
-    max_timeout = 115
+    max_timeout = 65
     last_log = 0
     is_early_rate_limit = False
     rate_limit_reason = ""
@@ -1854,87 +1854,100 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             last_log = int(elapsed)
             print(f"⏳ Waiting for Meta AI... {elapsed:.1f}s elapsed")
 
-        # Hydrate virtualized container & trigger lazy loading of rendered media
-        try:
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        except Exception:
-            pass
+        # 1. Pure Atomic In-Page JavaScript Extraction (runs in 1ms directly inside Chrome's V8 engine)
+        # Eliminates Playwright locator timeouts, ignores React DOM mutations,
+        # filters out the 240x240 spinner & 288x288 input preview,
+        # and targets ONLY the 1600x1600 generated studio portrait (naturalWidth >= 800).
+        scan_result = page.evaluate("""(ignoreUrls) => {
+            const ignoreSet = new Set(ignoreUrls);
+            const imgs = Array.from(document.querySelectorAll('img'));
+            
+            // Hydrate virtual scroll
+            window.scrollTo(0, document.body.scrollHeight);
 
-        # 1. Reverse traversal of candidate images (newest photos first)
-        candidate_imgs = page.locator(
-            'img[src*="fbcdn.net"], img[src*="meta.com"], [data-testid*="media"] img, '
-            'article img:not([alt*="avatar"]), div[role="main"] img, img[src^="blob:"], img[src^="data:image/"]'
-        )
-        count = candidate_imgs.count()
-        if count > 0:
-            for i in range(count - 1, -1, -1):
-                img = candidate_imgs.nth(i)
+            for (let i = imgs.length - 1; i >= 0; i--) {
+                const img = imgs[i];
+                const src = img.src || img.getAttribute('src') || '';
+                if (!src || ignoreSet.has(src)) continue;
+                if (src.includes('avatar') || src.includes('profile') || src.includes('logo')) continue;
+
+                const nw = img.naturalWidth;
+                const nh = img.naturalHeight;
+
+                // High-resolution studio portrait output (Meta AI renders at 1600x1600 px)
+                // Spinners are 240x240 and user previews are 288x288.
+                if (nw >= 800 && nh >= 800) {
+                    return {
+                        found: true,
+                        src: src,
+                        width: nw,
+                        height: nh,
+                        isBlob: src.startsWith('blob:'),
+                        isDataUrl: src.startsWith('data:image/')
+                    };
+                }
+            }
+            return { found: false };
+        }""", list(pre_existing_urls))
+
+        if scan_result and scan_result.get("found"):
+            src = scan_result["src"]
+            generated_img_url = src
+            print(f"🎉 GENERATED PORTRAIT DETECTED in {elapsed:.2f}s! ✅")
+            print(f"📐 Render Dimensions: {scan_result['width']}x{scan_result['height']}px")
+
+            if scan_result["isBlob"]:
                 try:
-                    img.scroll_into_view_if_needed(timeout=800)
+                    b64_str = page.evaluate("""async (blobUrl) => {
+                        const resp = await fetch(blobUrl);
+                        const blob = await resp.blob();
+                        return new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                            reader.onerror = reject;
+                            reader.readAsDataURL(blob);
+                        });
+                    }""", src)
+                    if b64_str:
+                        generated_img_bytes = base64.b64decode(b64_str)
+                        print(f"✅ Extracted full high-res portrait blob bytes via JS FileReader ({len(generated_img_bytes)} bytes)")
+                        break
+                except Exception as e_blob:
+                    print(f"Notice extracting blob via JS: {e_blob}")
+            elif scan_result["isDataUrl"]:
+                try:
+                    b64_str = src.split(",", 1)[1] if "," in src else src
+                    generated_img_bytes = base64.b64decode(b64_str)
+                    print(f"✅ Extracted full high-res portrait data URL bytes ({len(generated_img_bytes)} bytes)")
+                    break
+                except Exception as e_data:
+                    print(f"Notice extracting data URL: {e_data}")
+            else:
+                # Direct HTTP request from Playwright context, fallback to in-page fetch
+                try:
+                    img_resp = page.request.get(src, timeout=12000)
+                    if img_resp.ok:
+                        generated_img_bytes = img_resp.body()
+                        print(f"✅ Downloaded full high-res portrait from CDN ({len(generated_img_bytes)} bytes)")
+                        break
                 except Exception:
-                    pass
-                src = img.get_attribute("src") or ""
-                if not src or src in pre_existing_urls:
-                    continue
-                box = img.bounding_box()
-                if box and box["width"] > 120 and box["height"] > 120:
-                    generated_img_url = src
-                    print(f"🎉 GENERATED PORTRAIT DETECTED in {elapsed:.2f}s! ✅")
-                    print(f"📐 Render Dimensions: {int(box['width'])}x{int(box['height'])}px")
-
-                    # Extract via JavaScript FileReader if blob URL
-                    if src.startswith("blob:"):
-                        try:
-                            b64_str = page.evaluate("""async (blobUrl) => {
-                                const resp = await fetch(blobUrl);
-                                const blob = await resp.blob();
-                                return new Promise((resolve, reject) => {
-                                    const reader = new FileReader();
-                                    reader.onloadend = () => resolve(reader.result.split(',')[1]);
-                                    reader.onerror = reject;
-                                    reader.readAsDataURL(blob);
-                                });
-                            }""", src)
-                            if b64_str:
-                                generated_img_bytes = base64.b64decode(b64_str)
-                                print(f"✅ Extracted full high-res portrait blob bytes via JS FileReader ({len(generated_img_bytes)} bytes)")
-                                break
-                        except Exception as e_blob:
-                            print(f"Notice extracting blob via JS: {e_blob}")
-                    elif src.startswith("data:image/"):
-                        try:
-                            b64_str = src.split(",", 1)[1] if "," in src else src
+                    try:
+                        b64_str = page.evaluate("""async (url) => {
+                            const resp = await fetch(url);
+                            const blob = await resp.blob();
+                            return new Promise((resolve, reject) => {
+                                const reader = new FileReader();
+                                reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                                reader.onerror = reject;
+                                reader.readAsDataURL(blob);
+                            });
+                        }""", src)
+                        if b64_str:
                             generated_img_bytes = base64.b64decode(b64_str)
-                            print(f"✅ Extracted full high-res portrait data URL bytes ({len(generated_img_bytes)} bytes)")
+                            print(f"✅ Downloaded full portrait via in-page fetch ({len(generated_img_bytes)} bytes)")
                             break
-                        except Exception as e_data:
-                            print(f"Notice extracting data URL: {e_data}")
-                    else:
-                        # Try direct request, fallback to in-page fetch
-                        try:
-                            img_resp = page.request.get(src)
-                            if img_resp.ok:
-                                generated_img_bytes = img_resp.body()
-                                print(f"✅ Downloaded full high-res portrait from CDN ({len(generated_img_bytes)} bytes)")
-                                break
-                        except Exception:
-                            try:
-                                b64_str = page.evaluate("""async (url) => {
-                                    const resp = await fetch(url);
-                                    const blob = await resp.blob();
-                                    return new Promise((resolve, reject) => {
-                                        const reader = new FileReader();
-                                        reader.onloadend = () => resolve(reader.result.split(',')[1]);
-                                        reader.onerror = reject;
-                                        reader.readAsDataURL(blob);
-                                    });
-                                }""", src)
-                                if b64_str:
-                                    generated_img_bytes = base64.b64decode(b64_str)
-                                    print(f"✅ Downloaded full portrait via in-page fetch ({len(generated_img_bytes)} bytes)")
-                                    break
-                            except Exception:
-                                pass
+                    except Exception:
+                        pass
 
         if generated_img_bytes:
             break
