@@ -1618,8 +1618,9 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
     # 1. Locate Composer Input / Area
     composer = page.locator(
-        'textarea[data-testid="composer-input"], '
+        'div[data-testid="composer-input"]:visible, '
         'div[contenteditable="true"]:visible, '
+        'textarea[data-testid="composer-input"]:visible, '
         'textarea:visible'
     ).first
     composer_ready = False
@@ -1741,7 +1742,7 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
     # 5. Monitor Generation & Detect Result Image
     generated_img_url = None
-    max_timeout = 85
+    max_timeout = 115
     last_log = 0
 
     while time.time() - gen_start < max_timeout:
@@ -1761,7 +1762,7 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
                 if img.is_visible():
                     src = img.get_attribute("src") or ""
                     box = img.bounding_box()
-                    if box and box["width"] > 160 and box["height"] > 160:
+                    if box and box["width"] > 140 and box["height"] > 140:
                         generated_img_url = src
                         print(f"🎉 GENERATED PORTRAIT DETECTED in {elapsed:.2f}s! ✅")
                         print(f"📐 Render Dimensions: {int(box['width'])}x{int(box['height'])}px")
