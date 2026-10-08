@@ -1015,7 +1015,7 @@ def find_and_lock_next_meta_account(slot_id, exclude_indices=None, device_id="")
             import random
             chosen_idx = random.choice(best_candidates)
         else:
-            chosen_idx = 0 if total_accounts > 0 else None
+            chosen_idx = None
 
         if chosen_idx is not None:
             atomic_lock_meta_account(chosen_idx, slot_id, device_id)
@@ -1024,14 +1024,7 @@ def find_and_lock_next_meta_account(slot_id, exclude_indices=None, device_id="")
     except Exception as e:
         print(f"❌ Meta AI account selection error: {_safe_err(e)}")
 
-    try:
-        accounts = get_decrypted_meta_pool()
-        if accounts:
-            atomic_lock_meta_account(0, slot_id, device_id)
-            return 0, get_active_meta_cookie(0)
-    except Exception:
-        pass
-
+    # Account #0 fallback is completely removed: never double-book Account #0
     return None, None
 
 
@@ -1049,6 +1042,159 @@ def check_login_or_auth_expired(page):
     except Exception:
         pass
     return None
+
+
+def check_meta_login_or_auth_expired(page):
+    try:
+        current_url = page.url.lower()
+        if "/login" in current_url or "facebook.com/login" in current_url:
+            return "Redirected to login URL"
+        page_title = page.title().lower()
+        if "log in" in page_title or "sign up" in page_title:
+            return "Login prompt in page title"
+
+        # Check prominent login buttons
+        login_selectors = [
+            'button:has-text("Log in")',
+            'button:has-text("Log In")',
+            'a:has-text("Log in")',
+            'a:has-text("Log In")',
+            'button:has-text("Sign up")',
+            'button:has-text("Sign Up")',
+            'a:has-text("Sign up")',
+            'a:has-text("Sign Up")',
+            '[data-testid*="login_button"]'
+        ]
+        for sel in login_selectors:
+            try:
+                elem = page.locator(sel).first
+                if elem.count() > 0 and elem.is_visible():
+                    return f"Found login element: {sel}"
+            except Exception:
+                pass
+
+        # If composer is visible, the session is definitely active and valid!
+        composer = page.locator('div[contenteditable="true"]:visible, textarea:visible').first
+        if composer.count() > 0 and composer.is_visible():
+            return None
+    except Exception:
+        pass
+    return None
+
+
+def acquire_execution_account(slot_id, preferred_engine="META_AI", requested_account_idx=None, device_id="", max_wait_sec=40):
+    """
+    3-Tier Commercial Supercomputer Account Router:
+    - Tier 1: Allocate requested or preferred engine account.
+    - Tier 2: Cross-engine spillover (Meta AI <-> ChatGPT VIP) for up to 34 concurrent devices.
+    - Tier 3: Graceful non-blocking wait queue (up to max_wait_sec) if all 34 nodes are saturated.
+    Never falls back to Account #0. Zero collisions.
+    """
+    now_ms = int(time.time() * 1000)
+
+    # 1. Handle Explicit or Pre-Reserved Account Index if valid
+    if requested_account_idx is not None and str(requested_account_idx).strip() != "" and str(requested_account_idx).lower() not in ("auto", "none", "null"):
+        try:
+            req_idx = int(requested_account_idx)
+            is_conflict = False
+            if preferred_engine == "META_AI":
+                req_chk = urllib.request.Request(f"{FIREBASE_META_STATUS_BASE}/acc_{req_idx}.json", headers={"User-Agent": "StudioCloudWorker"})
+                with urllib.request.urlopen(req_chk, timeout=6) as r_chk:
+                    chk_stat = json.loads(r_chk.read().decode("utf-8")) or {}
+                    chk_until = int(chk_stat.get("bookedUntil", 0))
+                    chk_by = str(chk_stat.get("bookedBy", ""))
+                    chk_busy = bool(chk_stat.get("isBusy", False))
+                    is_expired = bool(chk_stat.get("isExpired", False))
+                    if is_expired or (chk_until > now_ms and (chk_busy or chk_by) and not chk_by.startswith(f"cloud_runner_{slot_id}")):
+                        is_conflict = True
+                if not is_conflict:
+                    atomic_lock_meta_account(req_idx, slot_id, device_id)
+                    return "META_AI", req_idx, get_active_meta_cookie(req_idx)
+                else:
+                    print(f"⚠️ Pre-reserved Meta AI Account #{req_idx + 1} is busy or expired. Dynamically re-routing...")
+            else:
+                req_chk = urllib.request.Request(f"{FIREBASE_STATUS_BASE}/acc_{req_idx}.json", headers={"User-Agent": "StudioCloudWorker"})
+                with urllib.request.urlopen(req_chk, timeout=6) as r_chk:
+                    chk_stat = json.loads(r_chk.read().decode("utf-8")) or {}
+                    chk_until = int(chk_stat.get("bookedUntil", 0))
+                    chk_by = str(chk_stat.get("bookedBy", ""))
+                    chk_busy = bool(chk_stat.get("isBusy", False))
+                    is_expired = bool(chk_stat.get("isExpired", False))
+                    if is_expired or (chk_until > now_ms and (chk_busy or chk_by) and not chk_by.startswith(f"cloud_runner_{slot_id}")):
+                        is_conflict = True
+                if not is_conflict:
+                    atomic_lock_account(req_idx, slot_id, device_id)
+                    return "CHATGPT", req_idx, get_active_cookie(req_idx)
+                else:
+                    print(f"⚠️ Pre-reserved ChatGPT VIP Account #{req_idx + 1} is busy or expired. Dynamically re-routing...")
+        except Exception as e_req:
+            print(f"Notice validating requested account #{requested_account_idx}: {_safe_err(e_req)}")
+
+    # 2. Dynamic Immediate Allocation: Tier 1 (Primary) -> Tier 2 (Spillover)
+    if preferred_engine == "META_AI":
+        # Tier 1: Try Meta AI Turbo pool
+        idx, cookie = find_and_lock_next_meta_account(slot_id, device_id=device_id)
+        if idx is not None and cookie:
+            return "META_AI", idx, cookie
+
+        # Tier 2: Seamless Spillover to ChatGPT VIP pool (Expands capacity to 34 phones)
+        print(f"⚡ Peak Load Spillover: All 17 Meta AI accounts busy! Checking ChatGPT VIP reserve for {_mask_task(slot_id)}...")
+        idx, cookie = find_and_lock_next_account(slot_id, device_id=device_id)
+        if idx is not None and cookie:
+            print(f"🚀 Dual-Engine Spillover: Successfully assigned ChatGPT VIP Account #{idx + 1} for {_mask_task(slot_id)}! (34-Node Cluster)")
+            return "CHATGPT", idx, cookie
+    else:
+        # Preferred is CHATGPT
+        idx, cookie = find_and_lock_next_account(slot_id, device_id=device_id)
+        if idx is not None and cookie:
+            return "CHATGPT", idx, cookie
+
+        # Spillover to Meta AI Turbo
+        print(f"⚡ Peak Load Spillover: All 17 ChatGPT VIP accounts busy! Checking Meta AI Turbo reserve for {_mask_task(slot_id)}...")
+        idx, cookie = find_and_lock_next_meta_account(slot_id, device_id=device_id)
+        if idx is not None and cookie:
+            print(f"🚀 Dual-Engine Spillover: Successfully assigned Meta AI Turbo Account #{idx + 1} for {_mask_task(slot_id)}! (34-Node Cluster)")
+            return "META_AI", idx, cookie
+
+    # 3. Tier 3: Graceful Waiting Queue (30 - 40 seconds)
+    # Both 17-account clusters are saturated (34+ concurrent devices active)
+    wait_start = time.time()
+    poll_interval = 3
+    print(f"⏳ Peak Cluster Load: All 34 nodes across Meta AI & ChatGPT are actively processing! Entering graceful wait queue (up to {max_wait_sec}s) for {_mask_task(slot_id)}...")
+    update_slot_data(slot_id, {
+        "status": "QUEUED",
+        "queueMessage": "Studio cluster at peak capacity. Queued for next available node (~20-30s)..."
+    })
+
+    while (time.time() - wait_start) < max_wait_sec:
+        time.sleep(poll_interval)
+
+        # Check if slot was cancelled by user
+        try:
+            cur_slot = fetch_slot_data(slot_id)
+            if cur_slot.get("status") == "CANCELLED":
+                print(f"⏹️ Slot {_mask_task(slot_id)} was cancelled by client while waiting in queue. Exiting cleanly.")
+                return None, None, None
+        except Exception:
+            pass
+
+        # Try Meta AI first (Fast turnaround: ~28s per generation)
+        idx, cookie = find_and_lock_next_meta_account(slot_id, device_id=device_id)
+        if idx is not None and cookie:
+            waited = int(time.time() - wait_start)
+            print(f"🎉 Slot freed in Meta AI Turbo! Acquired Account #{idx + 1} after {waited}s in queue.")
+            return "META_AI", idx, cookie
+
+        # Try ChatGPT VIP
+        idx, cookie = find_and_lock_next_account(slot_id, device_id=device_id)
+        if idx is not None and cookie:
+            waited = int(time.time() - wait_start)
+            print(f"🎉 Slot freed in ChatGPT VIP! Acquired Account #{idx + 1} after {waited}s in queue.")
+            return "CHATGPT", idx, cookie
+
+    waited_total = int(time.time() - wait_start)
+    print(f"⚠️ Queue timeout ({waited_total}s) reached for {_mask_task(slot_id)}. All 34 cluster nodes remained busy.")
+    return None, None, None
 
 
 def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_start, device_id="", switched_from=None, switch_reason=None):
@@ -1668,33 +1814,32 @@ def process_studio_task(slot_id):
                 pass
         return
 
+    # 🔒 Commercial Supercomputer Router: Zero-Collision Allocation, 34-Node Concurrency & Graceful Wait Queue
+    acquired_engine, account_idx, active_cookie = acquire_execution_account(
+        slot_id=slot_id,
+        preferred_engine=task_engine,
+        requested_account_idx=account_idx,
+        device_id=device_id,
+        max_wait_sec=40
+    )
+
+    if acquired_engine is None or account_idx is None or not active_cookie:
+        err = "ALL_NODES_BUSY: Studio cluster is at peak capacity across all 34 nodes. Please retry in 1 minute."
+        print(f"⚠️ {err} for {_mask_task(slot_id)}")
+        update_firebase_result(slot_id, "FAILED", error=err, engine=public_engine)
+        update_slot_data(slot_id, {"status": "FAILED", "error": err})
+        return
+
+    task_engine = acquired_engine
+    public_engine = "STUDIO_TURBO" if task_engine == "META_AI" else "STUDIO_PRO"
+    update_slot_data(slot_id, {"accountIndex": account_idx, "engine": public_engine, "status": "PENDING"})
+
     if task_engine == "META_AI":
         # ====================================================================
         # ⚡ TIER 1: HIGH-SPEED TURBO ENGINE (425 Daily Cluster Capacity)
         # ====================================================================
-        print(f"⚡ Engine Routed: {public_engine} (Tier 1 Primary Engine, 425 Daily Pool) 🚀")
-        raw_meta_cookie_data = None
-        if account_idx is None or str(account_idx).strip() == "" or str(account_idx).lower() in ("auto", "none", "null"):
-            print(f"🧠 Studio Turbo Dispatch: Dynamically picking best account for {_mask_task(slot_id)}...")
-            account_idx, raw_meta_cookie_data = find_and_lock_next_meta_account(slot_id, device_id=device_id)
-            if account_idx is None or not raw_meta_cookie_data:
-                err = "ALL_NODES_BUSY: Studio cluster is currently at capacity. Please retry or fallback to Ultra HD."
-                print(f"⚠️ {err} for {_mask_task(slot_id)}")
-                update_firebase_result(slot_id, "FAILED", error=err, engine=public_engine)
-                update_slot_data(slot_id, {"status": "FAILED", "error": err})
-                return
-            update_slot_data(slot_id, {"accountIndex": account_idx, "engine": public_engine})
-        else:
-            try:
-                account_idx = int(account_idx)
-                atomic_lock_meta_account(account_idx, slot_id, device_id)
-                raw_meta_cookie_data = get_active_meta_cookie(account_idx)
-            except Exception:
-                err = f"FAILED: Invalid accountIndex '{account_idx}' for task {_mask_task(slot_id)}"
-                print(f"❌ {err}")
-                update_firebase_result(slot_id, "FAILED", error=err, engine=public_engine)
-                update_slot_data(slot_id, {"status": "FAILED"})
-                return
+        print(f"⚡ Engine Routed: {public_engine} (Account #{account_idx + 1}, Tier 1 Primary Engine, 425 Daily Pool) 🚀")
+        raw_meta_cookie_data = active_cookie
 
         if not device_id:
             try:
@@ -1767,6 +1912,36 @@ def process_studio_task(slot_id):
                 except Exception:
                     pass
 
+            # Auth / Expiration Pre-Flight Check
+            auth_err = check_meta_login_or_auth_expired(page)
+            if auth_err:
+                print(f"⚠️ Meta AI Account #{int(account_idx)+1} auth check notice: {auth_err}. Retrying reload in 5s...")
+                time.sleep(5.0)
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=25000)
+                    time.sleep(2.0)
+                    auth_err = check_meta_login_or_auth_expired(page)
+                except Exception:
+                    pass
+
+            if auth_err:
+                print(f"❌ Meta AI Account #{int(account_idx)+1} session expired or unauthenticated: {auth_err}")
+                mark_meta_account_expired(account_idx)
+                meta_pool = get_decrypted_meta_pool()
+                acc_email = meta_pool[account_idx].get("email", "") if (account_idx is not None and account_idx < len(meta_pool)) else f"Account #{int(account_idx)+1}"
+                send_whatsapp_alert(
+                    f"⚠️ *META AI SESSION EXPIRED* 🛑\n"
+                    f"Account #{int(account_idx)+1} ({acc_email})\n"
+                    f"Reason: {auth_err}\n"
+                    f"Action: Node marked expired in pool. Please re-login."
+                )
+                err = f"AUTH_EXPIRED: Meta AI node #{int(account_idx)+1} session expired. Auto-failover requested."
+                update_firebase_result(slot_id, "FAILED", error=err, account_idx=account_idx, engine=public_engine)
+                update_slot_data(slot_id, {"status": "FAILED", "error": err})
+                atomic_unlock_meta_account(account_idx, slot_id)
+                browser.close()
+                return
+
             current_slot = fetch_slot_data(slot_id)
             current_status = current_slot.get("status", initial_status)
             current_input = current_slot.get("input", {})
@@ -1832,59 +2007,8 @@ def process_studio_task(slot_id):
     # ========================================================================
     # 🤖 TIER 2: CHATGPT VIP ENGINE (Fallback & Quality Fine-Tuning)
     # ========================================================================
-    print(f"🤖 Engine Routed: CHATGPT VIP (Tier 2 Fine-Tuning Reserve) 🌟")
-    raw_cookie = ""
-    # Autonomous Server Dispatch: If client omitted accountIndex (stealth blind client), server dynamically allocates best account!
-    if account_idx is None or str(account_idx).strip() == "" or str(account_idx).lower() in ("auto", "none", "null"):
-        print(f"🧠 Autonomous Server Dispatch: Dynamically picking best account from pool for {_mask_task(slot_id)}...")
-        account_idx, raw_cookie = find_and_lock_next_account(slot_id, device_id=device_id)
-        if account_idx is None or not raw_cookie:
-            err = "ALL_NODES_BUSY: Supercomputer cluster is currently at capacity. Please retry in 1 minute."
-            print(f"⚠️ {err} for {_mask_task(slot_id)}")
-            update_firebase_result(slot_id, "FAILED", error=err)
-            update_slot_data(slot_id, {"status": "FAILED", "error": err})
-            return
-        update_slot_data(slot_id, {"accountIndex": account_idx})
-    else:
-        # Pre-Reserved or Backward Compatibility: Support server-assigned / client accountIndex
-        try:
-            account_idx = int(account_idx)
-            # 🛡️ Dynamic Race-Condition Guard for Multi-Device Concurrency:
-            # Check if this account is currently held and busy by another running slot
-            is_conflict = False
-            try:
-                now_ms = int(time.time() * 1000)
-                req_chk = urllib.request.Request(f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json", headers={"User-Agent": "StudioCloudWorker"})
-                with urllib.request.urlopen(req_chk, timeout=6) as r_chk:
-                    chk_stat = json.loads(r_chk.read().decode("utf-8")) or {}
-                    chk_until = int(chk_stat.get("bookedUntil", 0))
-                    chk_by = str(chk_stat.get("bookedBy", ""))
-                    chk_busy = bool(chk_stat.get("isBusy", False))
-                    if chk_until > now_ms and (chk_busy or chk_by):
-                        if not chk_by.startswith(f"cloud_runner_{slot_id}"):
-                            is_conflict = True
-                            print(f"⚠️ Account #{account_idx + 1} is busy with another runner. Resolving collision dynamically...")
-            except Exception:
-                pass
-
-            if is_conflict:
-                account_idx, raw_cookie = find_and_lock_next_account(slot_id, exclude_indices={account_idx}, device_id=device_id)
-                if account_idx is None or not raw_cookie:
-                    err = "ALL_NODES_BUSY: Supercomputer cluster is currently at capacity. Please retry in 1 minute."
-                    print(f"⚠️ {err} for {_mask_task(slot_id)}")
-                    update_firebase_result(slot_id, "FAILED", error=err)
-                    update_slot_data(slot_id, {"status": "FAILED", "error": err})
-                    return
-                update_slot_data(slot_id, {"accountIndex": account_idx})
-            else:
-                atomic_lock_account(account_idx, slot_id, device_id)
-                raw_cookie = get_active_cookie(account_idx)
-        except Exception:
-            err = f"FAILED: Invalid accountIndex '{account_idx}' in task payload for {_mask_task(slot_id)}"
-            print(f"❌ {err}. Aborting immediately.")
-            update_firebase_result(slot_id, "FAILED", error=err)
-            update_slot_data(slot_id, {"status": "FAILED"})
-            return
+    print(f"🤖 Engine Routed: {public_engine} (Account #{account_idx + 1}, Tier 2 Fine-Tuning Reserve) 🌟")
+    raw_cookie = active_cookie
 
     task_type = slot_data.get("taskType") or input_data.get("taskType", "PHOTO_JOB")
     is_quota_probe = (task_type == "VERIFY_QUOTA") or slot_id.startswith("probe_acc_")
@@ -2680,6 +2804,145 @@ def run_nightly_maintenance():
                 if res == "BUSY":
                     print(f"ℹ️ Account #{idx+1} still busy with customer photo job. Leaving lock untouched for safety.")
 
+        # ====================================================================
+        # ⚡ PHASE 2: META AI CLUSTER AUTONOMOUS MAINTENANCE (17 Accounts)
+        # ====================================================================
+        print("\n" + "=" * 65)
+        print("⚡ RUNNING META AI CLUSTER AUTONOMOUS MAINTENANCE")
+        print("=" * 65)
+
+        meta_accounts = get_decrypted_meta_pool()
+        total_meta = len(meta_accounts)
+        meta_active_count = 0
+        meta_refreshed_count = 0
+        meta_expired_count = 0
+
+        def maintain_single_meta_account(m_idx, is_retry=False):
+            nonlocal meta_active_count, meta_refreshed_count, meta_expired_count
+            now_ms = int(time.time() * 1000)
+
+            # 1. Active lock check: never collide with or overwrite a customer photo job
+            try:
+                check_url = f"{FIREBASE_META_STATUS_BASE}/acc_{m_idx}.json"
+                req_c = urllib.request.Request(check_url, headers={"User-Agent": "StudioCloudWorker"})
+                with urllib.request.urlopen(req_c, timeout=5) as resp_c:
+                    curr_status = json.loads(resp_c.read().decode("utf-8") or "{}")
+                    booked_until = curr_status.get("bookedUntil", 0)
+                    booked_by = curr_status.get("bookedBy", "")
+                    is_busy = curr_status.get("isBusy", False)
+                    if is_busy or (booked_until > now_ms and booked_by and booked_by != "nightly_maintenance"):
+                        remain_sec = int((booked_until - now_ms) / 1000) if booked_until > now_ms else 0
+                        print(f"⏳ Meta Account #{m_idx+1} is actively in use ({_mask_device(booked_by)}, {remain_sec}s lease, isBusy={is_busy}). Skipping for later retry.")
+                        return "BUSY"
+            except Exception as e_check:
+                print(f"Notice checking lock on Meta Account #{m_idx+1}: {_safe_err(e_check)}")
+
+            # 2. Acquire maintenance lock safely
+            lock_acquired = False
+            try:
+                lock_url = f"{FIREBASE_META_STATUS_BASE}/acc_{m_idx}.json"
+                req_l = urllib.request.Request(
+                    lock_url,
+                    data=json.dumps({"bookedBy": "nightly_maintenance", "bookedUntil": now_ms + 120_000}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="PATCH"
+                )
+                with urllib.request.urlopen(req_l, timeout=5) as resp_l:
+                    lock_acquired = resp_l.status in (200, 204)
+            except Exception:
+                pass
+
+            raw_meta = get_active_meta_cookie(m_idx)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 850},
+                device_scale_factor=1,
+                locale="en-US",
+                timezone_id="Asia/Kathmandu"
+            )
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            inject_meta_cookies_to_context(context, raw_meta)
+            page = context.new_page()
+
+            try:
+                tag = f"[{'RETRY ' if is_retry else ''}Meta {m_idx+1}/{total_meta}]"
+                print(f"\n{tag} 🔍 Checking Meta AI Account #{m_idx+1}...")
+                page.goto("https://www.meta.ai", wait_until="domcontentloaded", timeout=40000)
+                time.sleep(2.0)
+
+                # Pre-flight auth check with retry guardrail against transient network blips
+                auth_err = check_meta_login_or_auth_expired(page)
+                if auth_err:
+                    print(f"⚠️ Meta Account #{m_idx+1} initial check note: {auth_err}. Retrying in 10s to guard against transient blips...")
+                    time.sleep(10.0)
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=30000)
+                        time.sleep(2.0)
+                        auth_err = check_meta_login_or_auth_expired(page)
+                    except Exception as e_re:
+                        auth_err = f"Retry failed: {_safe_err(e_re)}"
+
+                if auth_err:
+                    print(f"❌ Meta Account #{m_idx+1} confirmed expired after retry: {auth_err}")
+                    mark_meta_account_expired(m_idx)
+                    meta_expired_count += 1
+                else:
+                    meta_active_count += 1
+                    # Dismiss popups
+                    for btn_text in ["Stay logged out", "Dismiss", "Close", "Not now", "Got it", "Maybe later", "Okay", "Continue", "Decline"]:
+                        try:
+                            btn = page.locator(f'button:has-text("{btn_text}")').first
+                            if btn.count() > 0 and btn.is_visible():
+                                btn.click(timeout=1000)
+                        except Exception:
+                            pass
+
+                    # Touch session & sync fresh cookies to Firebase
+                    time.sleep(1.5)
+                    synced = sync_fresh_meta_cookies(context, m_idx)
+                    if synced:
+                        meta_refreshed_count += 1
+                        print(f"✅ Meta Account #{m_idx+1} session active & fresh cookies persisted to Firebase!")
+                    else:
+                        print(f"✅ Meta Account #{m_idx+1} session verified and active!")
+                return "DONE"
+            except Exception as e_acc:
+                print(f"⚠️ Error during maintenance on Meta Account #{m_idx+1}: {_safe_err(e_acc)}")
+                return "ERROR"
+            finally:
+                if lock_acquired:
+                    try:
+                        unlock_url = f"{FIREBASE_META_STATUS_BASE}/acc_{m_idx}.json"
+                        req_u = urllib.request.Request(
+                            unlock_url,
+                            data=json.dumps({"bookedBy": "", "bookedUntil": 0, "isBusy": False}).encode("utf-8"),
+                            headers={"Content-Type": "application/json"},
+                            method="PATCH"
+                        )
+                        urllib.request.urlopen(req_u, timeout=5)
+                    except Exception:
+                        pass
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
+        # First pass across all Meta AI accounts
+        meta_skipped_for_retry = []
+        for m_idx in range(total_meta):
+            res = maintain_single_meta_account(m_idx, is_retry=False)
+            if res == "BUSY":
+                meta_skipped_for_retry.append(m_idx)
+
+        # Second pass: retry Meta accounts that were busy earlier
+        if meta_skipped_for_retry:
+            print(f"\n🔄 Second Pass: Retrying {len(meta_skipped_for_retry)} Meta accounts that were busy earlier...")
+            time.sleep(15.0)
+            for m_idx in meta_skipped_for_retry:
+                res = maintain_single_meta_account(m_idx, is_retry=True)
+                if res == "BUSY":
+                    print(f"ℹ️ Meta Account #{m_idx+1} still busy with customer photo job. Leaving lock untouched for safety.")
+
         browser.close()
 
     # Sync selectors if verified updates found
@@ -2697,18 +2960,25 @@ def run_nightly_maintenance():
 
     end_nepal = datetime.now(nepal_tz).strftime("%I:%M %p, %d %b %Y")
     summary_msg = (
-        f"✅ *JB STUDIO - NIGHTLY MAINTENANCE COMPLETED* 🌟\n"
+        f"✅ *JB STUDIO - DUAL-ENGINE NIGHTLY MAINTENANCE COMPLETED* 🌟\n"
         f"══════════════════════════════\n"
-        f"📊 *Total Accounts Inspected:* {total}\n"
-        f"🟢 *Active & Kept-Alive:* {active_count}\n"
-        f"🔄 *Tokens Rotated & Synced:* {refreshed_count}\n"
-        f"🔴 *Expired Accounts:* {expired_count}\n"
-        f"🎯 *DOM Selectors:* {selector_status_msg}\n"
+        f"⚡ *STUDIO TURBO (Meta AI Cluster - 17 Accounts)*:\n"
+        f"📊 Inspected: {total_meta} Accounts\n"
+        f"🟢 Active & Verified: {meta_active_count}\n"
+        f"🔄 Fresh Cookies Synced: {meta_refreshed_count}\n"
+        f"🔴 Expired Accounts: {meta_expired_count}\n"
+        f"──────────────────────────────\n"
+        f"🌟 *STUDIO PRO (ChatGPT VIP Cluster - 17 Accounts)*:\n"
+        f"📊 Inspected: {total} Accounts\n"
+        f"🟢 Active & Kept-Alive: {active_count}\n"
+        f"🔄 Tokens Rotated & Synced: {refreshed_count}\n"
+        f"🔴 Expired Accounts: {expired_count}\n"
+        f"🎯 Selectors: {selector_status_msg}\n"
+        f"──────────────────────────────\n"
         f"🧹 *Ephemeral Tasks Pruned:* {pruned_tasks}\n"
         f"⏰ *Completion Time:* {end_nepal}\n"
         f"══════════════════════════════\n"
-        f"🛡️ 10-day sliding window refreshed for all active accounts.\n"
-        f"Studio phones will operate 100% smoothly with zero PC uptime required!"
+        f"🛡️ Complete 34-Node Supercomputer Cluster refreshed and ready for peak walk-in rush!"
     )
     send_whatsapp_alert(summary_msg)
     print("\n" + summary_msg)
