@@ -1840,6 +1840,23 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         page.keyboard.press("Enter")
         print("⚡ Pressed Enter fallback!")
 
+    # Ensure transition into the active conversation thread
+    time.sleep(1.5)
+    if "/prompt/" not in page.url:
+        try:
+            page.wait_for_url("**/prompt/**", timeout=5000)
+            print(f"🔗 URL transitioned to active thread: {page.url}")
+        except Exception:
+            try:
+                top_thread = page.locator('nav a[href*="/prompt/"], div[role="navigation"] a[href*="/prompt/"], a[aria-current="page"]').first
+                if top_thread.count() > 0:
+                    print("🔗 Entering active conversation thread in sidebar...")
+                    top_thread.click(force=True, timeout=3000)
+                    time.sleep(1.5)
+                    print(f"🔗 Active thread URL: {page.url}")
+            except Exception as e_th:
+                print(f"Notice opening active thread: {e_th}")
+
     # 5. Monitor Generation & Detect Result Image
     generated_img_url = None
     generated_img_bytes = None
@@ -1853,6 +1870,16 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         if int(elapsed) % 5 == 0 and int(elapsed) != last_log:
             last_log = int(elapsed)
             print(f"⏳ Waiting for Meta AI... {elapsed:.1f}s elapsed")
+
+        # Safeguard: if page is not on /prompt/, click the top active thread to stay inside the conversation
+        if "/prompt/" not in page.url and (int(elapsed) % 4 == 0):
+            try:
+                top_thread = page.locator('nav a[href*="/prompt/"], div[role="navigation"] a[href*="/prompt/"]').first
+                if top_thread.count() > 0:
+                    top_thread.click(force=True, timeout=2000)
+                    time.sleep(0.5)
+            except Exception:
+                pass
 
         # 1. Pure Atomic In-Page JavaScript Extraction (runs in 1ms directly inside Chrome's V8 engine)
         # Eliminates Playwright locator timeouts, ignores React DOM mutations,
@@ -1905,6 +1932,19 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             generated_img_url = src
             print(f"🎉 GENERATED PORTRAIT DETECTED in {elapsed:.2f}s! ✅")
             print(f"📐 Render Dimensions: {scan_result['width']}x{scan_result['height']}px")
+
+            # Save live runner screenshot to Firebase for visual verification
+            try:
+                shot_bytes = page.screenshot(full_page=False)
+                shot_b64 = base64.b64encode(shot_bytes).decode("utf-8")
+                patch_firebase(f"{FIREBASE_TASKS_BASE}/{slot_id}.json", {
+                    "runnerScreenshot": shot_b64,
+                    "activeUrl": page.url,
+                    "detectedInSec": round(elapsed, 2)
+                })
+                print("📸 Uploaded runner verification screenshot to Firebase task node!")
+            except Exception as e_shot:
+                print(f"Notice uploading runner screenshot: {e_shot}")
 
             if scan_result["isBlob"]:
                 try:
