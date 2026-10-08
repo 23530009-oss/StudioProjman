@@ -1937,7 +1937,7 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             try:
                 shot_bytes = page.screenshot(full_page=False)
                 shot_b64 = base64.b64encode(shot_bytes).decode("utf-8")
-                patch_firebase(f"{FIREBASE_TASKS_BASE}/{slot_id}.json", {
+                update_slot_data(slot_id, {
                     "runnerScreenshot": shot_b64,
                     "activeUrl": page.url,
                     "detectedInSec": round(elapsed, 2)
