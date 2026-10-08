@@ -26,6 +26,8 @@ if not FIREBASE_BASE:
 FIREBASE_TASKS_BASE = f"{FIREBASE_BASE}/studio_tasks"
 FIREBASE_STATUS_BASE = f"{FIREBASE_BASE}/cookie_pool_status"
 FIREBASE_COOKIE_URL = f"{FIREBASE_BASE}/cookie_pool.json"
+FIREBASE_META_STATUS_BASE = f"{FIREBASE_BASE}/meta_cookie_pool_status"
+FIREBASE_META_COOKIE_URL = f"{FIREBASE_BASE}/meta_cookie_pool.json"
 FIREBASE_AUTH_TOKEN = (os.environ.get("FIREBASE_AUTH_TOKEN") or "").strip()
 
 # Transparent Firebase RTDB Auth Token injector
@@ -123,6 +125,37 @@ def get_decrypted_pool():
     accounts = parsed.get("accounts", [])
     if not accounts:
         raise RuntimeError("No accounts found in decrypted pool!")
+    return accounts
+
+
+_META_POOL_TIMESTAMP_MS = 0
+
+
+def get_decrypted_meta_pool():
+    global _META_POOL_TIMESTAMP_MS
+    # Check local pool file first (for simulation & local testing)
+    local_meta = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meta_cookie_pool.json")
+    if os.path.exists(local_meta):
+        try:
+            with open(local_meta, "r", encoding="utf-8") as f:
+                accounts = json.load(f)
+            if accounts:
+                return accounts
+        except Exception:
+            pass
+
+    req = urllib.request.Request(FIREBASE_META_COOKIE_URL, headers={"User-Agent": "StudioCloudWorker"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = json.loads(r.read().decode("utf-8"))
+
+    enc = data.get("enc", "")
+    decrypted = decrypt_data_aes(enc)
+    parsed = json.loads(decrypted)
+    _META_POOL_TIMESTAMP_MS = int(parsed.get("timestamp_ms", 0))
+
+    accounts = parsed.get("accounts", [])
+    if not accounts:
+        raise RuntimeError("No accounts found in decrypted Meta AI pool!")
     return accounts
 
 
@@ -283,6 +316,115 @@ def inject_cookies_to_context(context, raw_cookie_str):
     print(f"🍪 Injected {added} cookies (skipped: {skipped})")
 
 
+def sync_fresh_meta_cookies(context, account_idx):
+    if account_idx is None or context is None:
+        return False
+    try:
+        cookies = context.cookies()
+        if not cookies:
+            return False
+
+        meta_cookies = []
+        has_auth_token = False
+        for c in cookies:
+            dom = c.get("domain", "")
+            name = c.get("name", "")
+            if "meta.ai" in dom or "facebook.com" in dom:
+                meta_cookies.append(c)
+                if name in ("ecto_1_sess", "c_user", "xs", "datr"):
+                    has_auth_token = True
+
+        if not has_auth_token or not meta_cookies:
+            return False
+
+        json_str = json.dumps(meta_cookies)
+        encrypted_b64 = encrypt_data_aes(json_str)
+        now_ms = int(time.time() * 1000)
+
+        patch_url = f"{FIREBASE_META_STATUS_BASE}/acc_{account_idx}.json"
+        patch_payload = {
+            "freshCookie": encrypted_b64,
+            "lastCookieSync": now_ms
+        }
+        req = urllib.request.Request(
+            patch_url,
+            data=json.dumps(patch_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PATCH"
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            if r.status in (200, 204):
+                print(f"🔄 Meta Account #{int(account_idx)+1}: Session cookies captured & synced to Firebase! ({len(meta_cookies)} cookies)")
+                return True
+    except Exception as e:
+        print(f"⚠️ Notice on Meta cookie sync for Account #{int(account_idx)+1}: {_safe_err(e)}")
+    return False
+
+
+def get_active_meta_cookie(account_idx=None):
+    accounts = get_decrypted_meta_pool()
+    if account_idx is None:
+        return accounts[0]
+
+    try:
+        idx = int(account_idx) % len(accounts)
+    except Exception:
+        idx = 0
+
+    acc = accounts[idx]
+    # Check for fresh rotated cookie in Firebase status
+    try:
+        req_fresh = urllib.request.Request(f"{FIREBASE_META_STATUS_BASE}/acc_{idx}.json", headers={"User-Agent": "StudioCloudWorker"})
+        with urllib.request.urlopen(req_fresh, timeout=5) as resp:
+            stat_obj = json.loads(resp.read().decode("utf-8")) or {}
+            fresh_enc = stat_obj.get("freshCookie", "")
+            last_sync = int(stat_obj.get("lastCookieSync", 0))
+
+            if fresh_enc and isinstance(fresh_enc, str) and len(fresh_enc) > 30 and (last_sync >= _META_POOL_TIMESTAMP_MS):
+                decrypted = decrypt_data_aes(fresh_enc)
+                fresh_cookies = json.loads(decrypted)
+                if isinstance(fresh_cookies, list) and len(fresh_cookies) > 0:
+                    print(f"🎯 Assigned Meta AI Account #{idx + 1} (Using Fresh Synced Cookies 🔄, synced: {last_sync})")
+                    return {"account_number": idx + 1, "cookies": fresh_cookies, "folder": acc.get("folder", ""), "email": acc.get("email", "")}
+    except Exception as e_fresh:
+        pass
+
+    print(f"🎯 Assigned Meta AI Account #{idx + 1} (Using Pool Baseline Cookies 📦)")
+    return acc
+
+
+def inject_meta_cookies_to_context(context, cookies_data):
+    if not cookies_data:
+        return 0
+    if isinstance(cookies_data, dict):
+        cookie_list = cookies_data.get("cookies", [])
+    elif isinstance(cookies_data, list):
+        cookie_list = cookies_data
+    else:
+        cookie_list = []
+
+    if cookie_list:
+        context.add_cookies(cookie_list)
+        print(f"🍪 Injected {len(cookie_list)} Meta AI cookies into browser context.")
+        return len(cookie_list)
+
+    raw_str = cookies_data.get("cookie", "") if isinstance(cookies_data, dict) else str(cookies_data)
+    added = 0
+    for item in raw_str.split(";"):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        k, v = k.strip(), v.strip()
+        try:
+            context.add_cookies([{"name": k, "value": v, "domain": ".meta.ai", "path": "/", "secure": True}])
+            added += 1
+        except Exception:
+            pass
+    print(f"🍪 Injected {added} Meta AI cookies from header string.")
+    return added
+
+
 def fetch_slot_data(slot_id):
     url = f"{FIREBASE_TASKS_BASE}/{slot_id}.json"
     for attempt in range(1, 5):
@@ -320,13 +462,15 @@ def update_slot_data(slot_id, updates):
         return False
 
 
-def update_firebase_result(task_id, status, image_b64=None, error=None, account_idx=None, switched_from=None, switch_reason=None):
+def update_firebase_result(task_id, status, image_b64=None, error=None, account_idx=None, switched_from=None, switch_reason=None, engine=None):
     url = f"{FIREBASE_TASKS_BASE}/{task_id}/result.json"
     report = {
         "taskId": task_id,
         "status": status,
         "completedAt": time.time()
     }
+    if engine:
+        report["engine"] = engine
     if account_idx is not None:
         report["accountIndex"] = int(account_idx)
     if switched_from is not None:
@@ -713,6 +857,184 @@ def find_and_lock_next_account(slot_id, exclude_indices=None, device_id=""):
     return None, ""
 
 
+def atomic_lock_meta_account(account_idx, slot_id, device_id=""):
+    if account_idx is None:
+        return
+    try:
+        now_ms = int(time.time() * 1000)
+        acc_url = f"{FIREBASE_META_STATUS_BASE}/acc_{account_idx}.json"
+        payload = {
+            "bookedBy": f"cloud_runner_{slot_id}_{device_id}" if device_id else f"cloud_runner_{slot_id}",
+            "bookedUntil": now_ms + 180_000,
+            "lastUsed": now_ms,
+            "lastHeartbeat": now_ms,
+            "isBusy": True
+        }
+        if device_id:
+            payload["lastDevice"] = device_id
+        req = urllib.request.Request(
+            acc_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PATCH"
+        )
+        urllib.request.urlopen(req, timeout=5)
+        print(f"🔒 Atomically locked Meta AI Account #{int(account_idx)+1} for slot {_mask_task(slot_id)} (isBusy=True)")
+    except Exception as e:
+        print(f"⚠️ Failed to lock Meta AI Account #{int(account_idx)+1}: {_safe_err(e)}")
+
+
+def atomic_unlock_meta_account(account_idx, slot_id):
+    if account_idx is None:
+        return
+    try:
+        acc_url = f"{FIREBASE_META_STATUS_BASE}/acc_{account_idx}.json"
+        payload = {
+            "bookedBy": "",
+            "bookedUntil": 0,
+            "isBusy": False
+        }
+        req = urllib.request.Request(
+            acc_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PATCH"
+        )
+        urllib.request.urlopen(req, timeout=5)
+        print(f"🔓 Released lock on Meta AI Account #{int(account_idx)+1} for slot {_mask_task(slot_id)} (isBusy=False)")
+    except Exception as e:
+        print(f"⚠️ Failed to unlock Meta AI Account #{int(account_idx)+1}: {_safe_err(e)}")
+
+
+def mark_meta_account_rate_limited(account_idx, reset_time=None):
+    if account_idx is None:
+        return
+    try:
+        today_nepal = get_nepal_date_string()
+        max_images = 25
+        try:
+            req_stat = urllib.request.Request(f"{FIREBASE_META_STATUS_BASE}.json", headers={"User-Agent": "StudioCloudWorker"})
+            with urllib.request.urlopen(req_stat, timeout=5) as resp:
+                stat_data = json.loads(resp.read().decode("utf-8")) or {}
+                max_images = int(stat_data.get("maxImagesPerAccount", stat_data.get("max_images_per_account", 25)))
+        except Exception:
+            pass
+
+        acc_url = f"{FIREBASE_META_STATUS_BASE}/acc_{account_idx}.json"
+        patch_payload = {
+            "usage": max_images,
+            "quotaDay": today_nepal,
+            "bookedBy": "",
+            "bookedUntil": 0,
+            "rateLimitedAt": int(time.time() * 1000)
+        }
+        if reset_time:
+            patch_payload["resetTime"] = reset_time
+
+        req = urllib.request.Request(
+            acc_url,
+            data=json.dumps(patch_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PATCH"
+        )
+        urllib.request.urlopen(req, timeout=5)
+        print(f"⚠️ Marked Meta AI account #{int(account_idx)+1} rate limited (usage={max_images}) in Firebase pool.")
+    except Exception as ex:
+        print(f"Failed to mark Meta rate limit: {_safe_err(ex)}")
+
+
+def mark_meta_account_expired(account_idx):
+    if account_idx is None:
+        return
+    try:
+        expire_url = f"{FIREBASE_META_STATUS_BASE}/acc_{account_idx}.json"
+        req = urllib.request.Request(
+            expire_url,
+            data=json.dumps({"isExpired": True, "bookedBy": "", "bookedUntil": 0, "freshCookie": "", "lastCookieSync": 0}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PATCH"
+        )
+        urllib.request.urlopen(req, timeout=5)
+        print(f"⚠️ Marked Meta AI account #{int(account_idx)+1} as isExpired in Firebase pool.")
+    except Exception as ex:
+        print(f"Failed to mark Meta expired: {_safe_err(ex)}")
+
+
+def find_and_lock_next_meta_account(slot_id, exclude_indices=None, device_id=""):
+    if exclude_indices is None:
+        exclude_indices = set()
+    else:
+        exclude_indices = set(exclude_indices)
+
+    print(f"🔄 Meta AI Router: Finding eligible Meta account (excluding: {exclude_indices})...")
+    today_nepal = get_nepal_date_string()
+    now_ms = int(time.time() * 1000)
+
+    try:
+        status_data = {}
+        try:
+            req = urllib.request.Request(f"{FIREBASE_META_STATUS_BASE}.json", headers={"User-Agent": "StudioCloudWorker"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                status_data = json.loads(resp.read().decode("utf-8")) or {}
+        except Exception:
+            pass
+
+        max_images = int(status_data.get("maxImagesPerAccount", status_data.get("max_images_per_account", 25)))
+        accounts = get_decrypted_meta_pool()
+        total_accounts = len(accounts)
+
+        candidates = []
+        for i in range(total_accounts):
+            if i in exclude_indices:
+                continue
+            acc_info = status_data.get(f"acc_{i}", {})
+            if acc_info.get("isExpired", False):
+                continue
+
+            booked_until = int(acc_info.get("bookedUntil", 0))
+            booked_by = acc_info.get("bookedBy", "")
+            if booked_until > now_ms:
+                is_our_slot = booked_by.startswith(f"cloud_runner_{slot_id}")
+                is_pre_reserved = bool(device_id and (booked_by == f"cloud_runner_{device_id}" or booked_by.startswith(f"cloud_runner_{device_id}_p")))
+                if not (is_our_slot or is_pre_reserved):
+                    continue
+                if not is_our_slot and acc_info.get("isBusy", False):
+                    continue
+
+            q_day = acc_info.get("quotaDay", "")
+            usage = int(acc_info.get("usage", 0)) if q_day == today_nepal else 0
+            remaining = max(0, max_images - usage)
+
+            if remaining > 0:
+                candidates.append((remaining, i))
+
+        if candidates:
+            candidates.sort(key=lambda x: -x[0])
+            max_rem = candidates[0][0]
+            best_candidates = [idx for rem, idx in candidates if rem == max_rem]
+            import random
+            chosen_idx = random.choice(best_candidates)
+        else:
+            chosen_idx = 0 if total_accounts > 0 else None
+
+        if chosen_idx is not None:
+            atomic_lock_meta_account(chosen_idx, slot_id, device_id)
+            print(f"✅ Meta AI Router: Assigned Account #{chosen_idx + 1} ({accounts[chosen_idx].get('email', '')})")
+            return chosen_idx, get_active_meta_cookie(chosen_idx)
+    except Exception as e:
+        print(f"❌ Meta AI account selection error: {_safe_err(e)}")
+
+    try:
+        accounts = get_decrypted_meta_pool()
+        if accounts:
+            atomic_lock_meta_account(0, slot_id, device_id)
+            return 0, get_active_meta_cookie(0)
+    except Exception:
+        pass
+
+    return None, None
+
+
 def check_login_or_auth_expired(page):
     try:
         current_url = page.url.lower()
@@ -1005,7 +1327,8 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             image_b64=out_b64,
             account_idx=account_idx,
             switched_from=switched_from,
-            switch_reason=switch_reason
+            switch_reason=switch_reason,
+            engine="STUDIO_PRO"
         )
         slot_patch = {"status": "COMPLETED", "accountIndex": account_idx}
         if switched_from is not None:
@@ -1111,6 +1434,184 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         return False
 
 
+def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_start, device_id=""):
+    print("=" * 60)
+    print(f"⚡ EXECUTING META AI GENERATION (Tier 1 Primary Engine)")
+    print(f"📋 Slot: {_mask_task(slot_id)} | Account #{int(account_idx) + 1}")
+    print("=" * 60)
+
+    temp_img_path = None
+    if img_b64:
+        try:
+            temp_img_path = os.path.join(tempfile.gettempdir(), f"{slot_id}_meta_in.png")
+            with open(temp_img_path, "wb") as f:
+                f.write(base64.b64decode(img_b64))
+            print(f"💾 Input photo saved: {temp_img_path} ({os.path.getsize(temp_img_path)} bytes)")
+        except Exception as e:
+            print(f"⚠️ Error saving temp input photo: {e}")
+
+    # 1. Locate Composer Input
+    composer = page.locator('div[contenteditable="true"]:visible, textarea:visible').first
+    composer_ready = False
+    try:
+        composer.wait_for(state="visible", timeout=25000)
+        composer_ready = True
+    except Exception:
+        pass
+
+    if not composer_ready:
+        err = f"STUDIO_ENGINE_TIMEOUT: Processing node not ready within 25s (Slot #{int(account_idx)+1})"
+        print(f"❌ {err}")
+        update_firebase_result(slot_id, "FAILED", error=err, account_idx=account_idx, engine="STUDIO_TURBO")
+        update_slot_data(slot_id, {"status": "FAILED"})
+        if temp_img_path and os.path.exists(temp_img_path):
+            try: os.remove(temp_img_path)
+            except Exception: pass
+        return False
+
+    # 2. Attach Photo via hidden input[type="file"]
+    if temp_img_path and os.path.exists(temp_img_path):
+        print("📤 Attaching source photo via input[type=file]...")
+        file_input = page.locator('input[type="file"]').first
+        try:
+            file_input.wait_for(state="attached", timeout=12000)
+            file_input.set_input_files(temp_img_path)
+            print("⏳ Waiting for photo attachment confirmation...")
+            preview_loc = page.locator('img[src^="blob:"], [data-testid*="attachment"], [class*="thumbnail"], button[aria-label*="Remove"]')
+            preview_loc.first.wait_for(state="visible", timeout=15000)
+            print("✅ Photo attached in composer!")
+        except Exception as e:
+            print(f"⚠️ Attachment notice: {e}")
+
+    # 3. Insert Studio Passport Prompt
+    print("📝 Inserting studio passport prompt into Meta AI composer...")
+    composer.click()
+    page.keyboard.insert_text(prompt)
+    time.sleep(1.0)
+
+    # 4. Locate Send Button & Submit
+    send_btn = page.locator('button[aria-label="Send"], button[type="submit"]:has(svg)').first
+    send_ready = False
+    try:
+        send_btn.wait_for(state="visible", timeout=6000)
+        for _ in range(15):
+            if send_btn.is_enabled():
+                send_ready = True
+                break
+            time.sleep(0.3)
+    except Exception:
+        pass
+
+    gen_start = time.time()
+    if send_ready:
+        send_btn.click(timeout=3000)
+        print("⚡ Clicked Send button!")
+    else:
+        page.keyboard.press("Enter")
+        print("⚡ Pressed Enter fallback!")
+
+    # 5. Monitor Generation & Detect Result Image
+    generated_img_url = None
+    max_timeout = 85
+    last_log = 0
+
+    while time.time() - gen_start < max_timeout:
+        elapsed = time.time() - gen_start
+        if int(elapsed) % 5 == 0 and int(elapsed) != last_log:
+            last_log = int(elapsed)
+            print(f"⏳ Waiting for Meta AI... {elapsed:.1f}s elapsed")
+
+        candidate_imgs = page.locator(
+            'img[src*="fbcdn.net"], img[src*="meta.com"], [data-testid*="media"] img, '
+            'article img:not([alt*="avatar"]):not([src^="blob:"]), div[role="main"] img:not([src^="blob:"])'
+        )
+        count = candidate_imgs.count()
+        if count > 0:
+            for i in range(count):
+                img = candidate_imgs.nth(i)
+                if img.is_visible():
+                    src = img.get_attribute("src") or ""
+                    box = img.bounding_box()
+                    if box and box["width"] > 160 and box["height"] > 160:
+                        generated_img_url = src
+                        print(f"🎉 GENERATED PORTRAIT DETECTED in {elapsed:.2f}s! ✅")
+                        print(f"📐 Render Dimensions: {int(box['width'])}x{int(box['height'])}px")
+                        break
+
+        if generated_img_url:
+            break
+        time.sleep(1.0)
+
+    gen_duration = time.time() - gen_start
+
+    # 6. Download High-Res Image Bytes & Convert to Base64
+    if generated_img_url:
+        print(f"📥 Downloading High-Res Portrait from Meta CDN ({gen_duration:.2f}s total)...")
+        try:
+            img_resp = page.request.get(generated_img_url)
+            if img_resp.ok:
+                img_bytes = img_resp.body()
+                b64_output = base64.b64encode(img_bytes).decode("utf-8")
+                print(f"✅ Full High-Res Portrait Downloaded! ({len(img_bytes) / 1024:.1f} KB)")
+
+                # Update Firebase task result
+                update_firebase_result(
+                    slot_id,
+                    "COMPLETED",
+                    image_b64=b64_output,
+                    account_idx=account_idx,
+                    engine="STUDIO_TURBO"
+                )
+                update_slot_data(slot_id, {
+                    "status": "COMPLETED",
+                    "engine": "STUDIO_TURBO",
+                    "generationTimeSec": round(gen_duration, 2)
+                })
+
+                # Increment usage for this Meta AI account
+                try:
+                    today_nepal = get_nepal_date_string()
+                    acc_url = f"{FIREBASE_META_STATUS_BASE}/acc_{account_idx}.json"
+                    req_u = urllib.request.Request(acc_url, headers={"User-Agent": "StudioCloudWorker"})
+                    with urllib.request.urlopen(req_u, timeout=5) as r_u:
+                        a_stat = json.loads(r_u.read().decode("utf-8")) or {}
+                    cur_u = int(a_stat.get("usage", 0)) if a_stat.get("quotaDay") == today_nepal else 0
+                    urllib.request.urlopen(urllib.request.Request(
+                        acc_url,
+                        data=json.dumps({"usage": cur_u + 1, "quotaDay": today_nepal}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="PATCH"
+                    ), timeout=5)
+                except Exception as e_cnt:
+                    print(f"⚠️ Notice incrementing Meta quota usage: {e_cnt}")
+
+                # Server-level device credit deduction
+                if device_id:
+                    deduct_server_device_credit(device_id)
+
+                # Sync fresh cookies from this session
+                sync_fresh_meta_cookies(page.context, account_idx)
+
+                # Clean up temp file
+                if temp_img_path and os.path.exists(temp_img_path):
+                    try: os.remove(temp_img_path)
+                    except Exception: pass
+
+                return True
+        except Exception as e_dl:
+            print(f"❌ Failed to download Meta AI image: {e_dl}")
+
+    # Fallback / Timeout
+    err = f"STUDIO_ENGINE_TIMEOUT: Portrait rendering exceeded timeout of {max_timeout}s"
+    print(f"❌ {err}")
+    update_firebase_result(slot_id, "FAILED", error=err, account_idx=account_idx, engine="STUDIO_TURBO")
+    update_slot_data(slot_id, {"status": "FAILED"})
+    if temp_img_path and os.path.exists(temp_img_path):
+        try: os.remove(temp_img_path)
+        except Exception: pass
+    return False
+
+
 def process_studio_task(slot_id):
     from playwright.sync_api import sync_playwright
 
@@ -1145,17 +1646,193 @@ def process_studio_task(slot_id):
     if account_idx is None:
         account_idx = input_data.get("accountIndex")
 
+    raw_engine = str(slot_data.get("engine") or input_data.get("engine") or "STUDIO_TURBO").strip().upper()
+    if raw_engine in ("STUDIO_PRO", "PRO", "VIP_HD", "CHATGPT"):
+        task_engine = "CHATGPT"
+        public_engine = "STUDIO_PRO"
+    else:
+        task_engine = "META_AI"
+        public_engine = "STUDIO_TURBO"
+
+    device_id = str(slot_data.get("deviceId") or input_data.get("deviceId") or "").strip()
+
     if initial_status == "CANCELLED":
         print(f"⏹️ Slot {_mask_task(slot_id)} was CANCELLED before processing started. Releasing lock and exiting immediately.")
         if account_idx is not None:
             try:
-                atomic_unlock_account(int(account_idx), slot_id)
+                if task_engine == "META_AI":
+                    atomic_unlock_meta_account(int(account_idx), slot_id)
+                else:
+                    atomic_unlock_account(int(account_idx), slot_id)
             except Exception:
                 pass
         return
 
-    device_id = str(slot_data.get("deviceId") or input_data.get("deviceId") or "").strip()
+    if task_engine == "META_AI":
+        # ====================================================================
+        # ⚡ TIER 1: HIGH-SPEED TURBO ENGINE (425 Daily Cluster Capacity)
+        # ====================================================================
+        print(f"⚡ Engine Routed: {public_engine} (Tier 1 Primary Engine, 425 Daily Pool) 🚀")
+        raw_meta_cookie_data = None
+        if account_idx is None or str(account_idx).strip() == "" or str(account_idx).lower() in ("auto", "none", "null"):
+            print(f"🧠 Studio Turbo Dispatch: Dynamically picking best account for {_mask_task(slot_id)}...")
+            account_idx, raw_meta_cookie_data = find_and_lock_next_meta_account(slot_id, device_id=device_id)
+            if account_idx is None or not raw_meta_cookie_data:
+                err = "ALL_NODES_BUSY: Studio cluster is currently at capacity. Please retry or fallback to Ultra HD."
+                print(f"⚠️ {err} for {_mask_task(slot_id)}")
+                update_firebase_result(slot_id, "FAILED", error=err, engine=public_engine)
+                update_slot_data(slot_id, {"status": "FAILED", "error": err})
+                return
+            update_slot_data(slot_id, {"accountIndex": account_idx, "engine": public_engine})
+        else:
+            try:
+                account_idx = int(account_idx)
+                atomic_lock_meta_account(account_idx, slot_id, device_id)
+                raw_meta_cookie_data = get_active_meta_cookie(account_idx)
+            except Exception:
+                err = f"FAILED: Invalid accountIndex '{account_idx}' for task {_mask_task(slot_id)}"
+                print(f"❌ {err}")
+                update_firebase_result(slot_id, "FAILED", error=err, engine=public_engine)
+                update_slot_data(slot_id, {"status": "FAILED"})
+                return
 
+        if not device_id:
+            try:
+                req_acc = urllib.request.Request(f"{FIREBASE_META_STATUS_BASE}/acc_{account_idx}.json", headers={"User-Agent": "StudioCloudWorker"})
+                with urllib.request.urlopen(req_acc, timeout=6) as r_acc:
+                    acc_stat = json.loads(r_acc.read().decode("utf-8")) or {}
+                    device_id = str(acc_stat.get("lastDevice") or acc_stat.get("bookedBy") or "").strip()
+            except Exception:
+                pass
+
+        # 🔒 Strict Server-Level Device Authorization
+        auth_ok, auth_err = verify_server_device_authorization(device_id)
+        if not auth_ok:
+            err = f"SERVER_AUTH_REJECTED: {auth_err}"
+            print(f"🛑 {err} for {_mask_task(slot_id)}. Aborting execution.")
+            atomic_unlock_meta_account(account_idx, slot_id)
+            update_firebase_result(slot_id, "FAILED", error=err, engine=public_engine)
+            update_slot_data(slot_id, {"status": "FAILED", "error": err})
+            return
+
+        initial_status = slot_data.get("status") or input_data.get("status", "PENDING")
+        img_b64 = input_data.get("imageBase64", "")
+        prompt = input_data.get("prompt", "Professional passport photo portrait")
+        is_prewarm = (initial_status == "WARMING") or (not img_b64 and initial_status != "PENDING")
+        t_start = time.time()
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                channel="chrome",
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-infobars",
+                    "--window-size=1280,850"
+                ]
+            )
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 850},
+                device_scale_factor=1,
+                locale="en-US",
+                timezone_id="Asia/Kathmandu"
+            )
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            inject_meta_cookies_to_context(context, raw_meta_cookie_data)
+            page = context.new_page()
+
+            def handle_route(route):
+                url = route.request.url.lower()
+                rtype = route.request.resource_type
+                if rtype in ["font", "media"]:
+                    route.abort()
+                elif any(blocked in url for blocked in ["statsig", "sentry", "datadog", "google-analytics", "analytics"]):
+                    route.abort()
+                else:
+                    route.continue_()
+            page.route("**/*", handle_route)
+
+            print(f"🌍 Navigating to Meta AI (https://www.meta.ai)...")
+            page.goto("https://www.meta.ai", wait_until="domcontentloaded", timeout=40000)
+
+            time.sleep(1.0)
+            for btn_text in ["Stay logged out", "Dismiss", "Close", "Not now", "Got it", "Maybe later", "Okay", "Continue", "Decline"]:
+                try:
+                    b = page.locator(f'button:has-text("{btn_text}")').first
+                    if b.count() > 0 and b.is_visible():
+                        b.click(timeout=1000)
+                except Exception:
+                    pass
+
+            current_slot = fetch_slot_data(slot_id)
+            current_status = current_slot.get("status", initial_status)
+            current_input = current_slot.get("input", {})
+            has_input = bool(current_input.get("imageBase64"))
+
+            if is_prewarm and not has_input and current_status != "PENDING":
+                update_slot_data(slot_id, {
+                    "status": "READY",
+                    "warmedAt": int(time.time() * 1000),
+                    "accountIndex": account_idx,
+                    "engine": public_engine
+                })
+                print(f"🔥 Studio Turbo Runner is WARM & READY in {time.time() - t_start:.2f}s! Entering 800ms standby poll loop (180s max)...")
+                standby_start = time.time()
+                task_received = False
+                while (time.time() - standby_start) < 180:
+                    poll_slot = fetch_slot_data(slot_id)
+                    p_status = poll_slot.get("status")
+                    p_input = poll_slot.get("input", {})
+                    if p_status == "PENDING" or p_input.get("imageBase64"):
+                        print(f"⚡ FAST PICKUP! Operator submitted photo after {time.time() - standby_start:.1f}s of standby!")
+                        prompt = p_input.get("prompt", prompt)
+                        img_b64 = p_input.get("imageBase64", "")
+                        update_slot_data(slot_id, {"status": "PROCESSING"})
+                        task_received = True
+                        break
+                    elif p_status == "CANCELLED":
+                        print(f"⏹️ Slot {_mask_task(slot_id)} was CANCELLED. Exiting cleanly.")
+                        atomic_unlock_meta_account(account_idx, slot_id)
+                        browser.close()
+                        return
+                    time.sleep(0.8)
+
+                if not task_received:
+                    print(f"⏰ Slot {_mask_task(slot_id)} 180s cloud watchdog expired with no operator input.")
+                    update_slot_data(slot_id, {"status": "EXPIRED"})
+                    atomic_unlock_meta_account(account_idx, slot_id)
+                    browser.close()
+                    return
+            else:
+                prompt = current_input.get("prompt", prompt)
+                img_b64 = current_input.get("imageBase64", img_b64)
+                update_slot_data(slot_id, {"status": "PROCESSING"})
+
+            if not img_b64:
+                err = "FAILED: No photo attached in task payload"
+                print(f"❌ {err}")
+                update_firebase_result(slot_id, "FAILED", error=err, account_idx=account_idx, engine=public_engine)
+                update_slot_data(slot_id, {"status": "FAILED"})
+                atomic_unlock_meta_account(account_idx, slot_id)
+                browser.close()
+                return
+
+            try:
+                execute_meta_ai_generation(
+                    page, slot_id, account_idx, prompt, img_b64, t_start, device_id=device_id
+                )
+            finally:
+                atomic_unlock_meta_account(account_idx, slot_id)
+                browser.close()
+        return
+
+    # ========================================================================
+    # 🤖 TIER 2: CHATGPT VIP ENGINE (Fallback & Quality Fine-Tuning)
+    # ========================================================================
+    print(f"🤖 Engine Routed: CHATGPT VIP (Tier 2 Fine-Tuning Reserve) 🌟")
     raw_cookie = ""
     # Autonomous Server Dispatch: If client omitted accountIndex (stealth blind client), server dynamically allocates best account!
     if account_idx is None or str(account_idx).strip() == "" or str(account_idx).lower() in ("auto", "none", "null"):
