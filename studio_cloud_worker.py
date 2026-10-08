@@ -1677,13 +1677,27 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     ).first
     composer_ready = False
     try:
-        composer.wait_for(state="visible", timeout=25000)
+        composer.wait_for(state="visible", timeout=35000)
         composer_ready = True
     except Exception:
-        pass
+        # Retry with reload once if stuck
+        try:
+            print(f"⚠️ Composer not visible in 35s on Account #{int(account_idx)+1}. Reloading page once...")
+            page.reload(wait_until="domcontentloaded", timeout=20000)
+            time.sleep(2.0)
+            composer = page.locator(
+                'div[data-testid="composer-input"]:visible, '
+                'div[contenteditable="true"]:visible, '
+                'textarea[data-testid="composer-input"]:visible, '
+                'textarea:visible'
+            ).first
+            composer.wait_for(state="visible", timeout=15000)
+            composer_ready = True
+        except Exception:
+            pass
 
     if not composer_ready:
-        err = f"STUDIO_ENGINE_TIMEOUT: Processing node not ready within 25s (Slot #{int(account_idx)+1})"
+        err = f"STUDIO_ENGINE_TIMEOUT: Processing node not ready within 50s (Slot #{int(account_idx)+1})"
         print(f"❌ {err}")
         update_firebase_result(slot_id, "FAILED", error=err, account_idx=account_idx, engine="STUDIO_TURBO")
         update_slot_data(slot_id, {"status": "FAILED"})
@@ -1828,6 +1842,7 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
     # 5. Monitor Generation & Detect Result Image
     generated_img_url = None
+    generated_img_bytes = None
     max_timeout = 115
     last_log = 0
     is_early_rate_limit = False
@@ -1839,27 +1854,89 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             last_log = int(elapsed)
             print(f"⏳ Waiting for Meta AI... {elapsed:.1f}s elapsed")
 
+        # Hydrate virtualized container & trigger lazy loading of rendered media
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            pass
+
         # 1. Reverse traversal of candidate images (newest photos first)
         candidate_imgs = page.locator(
             'img[src*="fbcdn.net"], img[src*="meta.com"], [data-testid*="media"] img, '
-            'article img:not([alt*="avatar"]):not([src^="blob:"]), div[role="main"] img:not([src^="blob:"])'
+            'article img:not([alt*="avatar"]), div[role="main"] img, img[src^="blob:"], img[src^="data:image/"]'
         )
         count = candidate_imgs.count()
         if count > 0:
             for i in range(count - 1, -1, -1):
                 img = candidate_imgs.nth(i)
-                if img.is_visible():
-                    src = img.get_attribute("src") or ""
-                    if not src or src in pre_existing_urls:
-                        continue
-                    box = img.bounding_box()
-                    if box and box["width"] > 140 and box["height"] > 140:
-                        generated_img_url = src
-                        print(f"🎉 GENERATED PORTRAIT DETECTED in {elapsed:.2f}s! ✅")
-                        print(f"📐 Render Dimensions: {int(box['width'])}x{int(box['height'])}px")
-                        break
+                try:
+                    img.scroll_into_view_if_needed(timeout=800)
+                except Exception:
+                    pass
+                src = img.get_attribute("src") or ""
+                if not src or src in pre_existing_urls:
+                    continue
+                box = img.bounding_box()
+                if box and box["width"] > 120 and box["height"] > 120:
+                    generated_img_url = src
+                    print(f"🎉 GENERATED PORTRAIT DETECTED in {elapsed:.2f}s! ✅")
+                    print(f"📐 Render Dimensions: {int(box['width'])}x{int(box['height'])}px")
 
-        if generated_img_url:
+                    # Extract via JavaScript FileReader if blob URL
+                    if src.startswith("blob:"):
+                        try:
+                            b64_str = page.evaluate("""async (blobUrl) => {
+                                const resp = await fetch(blobUrl);
+                                const blob = await resp.blob();
+                                return new Promise((resolve, reject) => {
+                                    const reader = new FileReader();
+                                    reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                                    reader.onerror = reject;
+                                    reader.readAsDataURL(blob);
+                                });
+                            }""", src)
+                            if b64_str:
+                                generated_img_bytes = base64.b64decode(b64_str)
+                                print(f"✅ Extracted full high-res portrait blob bytes via JS FileReader ({len(generated_img_bytes)} bytes)")
+                                break
+                        except Exception as e_blob:
+                            print(f"Notice extracting blob via JS: {e_blob}")
+                    elif src.startswith("data:image/"):
+                        try:
+                            b64_str = src.split(",", 1)[1] if "," in src else src
+                            generated_img_bytes = base64.b64decode(b64_str)
+                            print(f"✅ Extracted full high-res portrait data URL bytes ({len(generated_img_bytes)} bytes)")
+                            break
+                        except Exception as e_data:
+                            print(f"Notice extracting data URL: {e_data}")
+                    else:
+                        # Try direct request, fallback to in-page fetch
+                        try:
+                            img_resp = page.request.get(src)
+                            if img_resp.ok:
+                                generated_img_bytes = img_resp.body()
+                                print(f"✅ Downloaded full high-res portrait from CDN ({len(generated_img_bytes)} bytes)")
+                                break
+                        except Exception:
+                            try:
+                                b64_str = page.evaluate("""async (url) => {
+                                    const resp = await fetch(url);
+                                    const blob = await resp.blob();
+                                    return new Promise((resolve, reject) => {
+                                        const reader = new FileReader();
+                                        reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                                        reader.onerror = reject;
+                                        reader.readAsDataURL(blob);
+                                    });
+                                }""", src)
+                                if b64_str:
+                                    generated_img_bytes = base64.b64decode(b64_str)
+                                    print(f"✅ Downloaded full portrait via in-page fetch ({len(generated_img_bytes)} bytes)")
+                                    break
+                            except Exception:
+                                pass
+
+        if generated_img_bytes:
             break
 
         # 2. Fast-Break: Early Rate-Limit / Quota Detection (< 3s instead of hanging for 115s!)
@@ -1900,60 +1977,56 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
     gen_duration = time.time() - gen_start
 
-    # 6. Download High-Res Image Bytes & Convert to Base64
-    if generated_img_url:
-        print(f"📥 Downloading High-Res Portrait from Meta CDN ({gen_duration:.2f}s total)...")
+    # 6. Finalize High-Res Image Bytes & Convert to Base64
+    if generated_img_bytes:
+        print(f"📥 Finalizing High-Res Portrait from Meta AI ({gen_duration:.2f}s total)...")
         try:
-            img_resp = page.request.get(generated_img_url)
-            if img_resp.ok:
-                img_bytes = img_resp.body()
-                b64_output = base64.b64encode(img_bytes).decode("utf-8")
-                print(f"✅ Full High-Res Portrait Downloaded! ({len(img_bytes) / 1024:.1f} KB)")
+            b64_output = base64.b64encode(generated_img_bytes).decode("utf-8")
+            print(f"✅ Full High-Res Portrait Ready! ({len(generated_img_bytes) / 1024:.1f} KB)")
 
-                # Update Firebase task result
-                update_firebase_result(
-                    slot_id,
-                    "COMPLETED",
-                    image_b64=b64_output,
-                    account_idx=account_idx,
-                    engine="STUDIO_TURBO"
-                )
-                update_slot_data(slot_id, {
-                    "status": "COMPLETED",
-                    "engine": "STUDIO_TURBO",
-                    "generationTimeSec": round(gen_duration, 2)
-                })
+            # Update Firebase task result
+            update_firebase_result(
+                slot_id,
+                "COMPLETED",
+                image_b64=b64_output,
+                account_idx=account_idx,
+                engine="STUDIO_TURBO"
+            )
+            update_slot_data(slot_id, {
+                "status": "COMPLETED",
+                "engine": "STUDIO_TURBO",
+                "generationTimeSec": round(gen_duration, 2)
+            })
+            # Increment usage for this Meta AI account
+            try:
+                today_nepal = get_nepal_date_string()
+                acc_url = f"{FIREBASE_META_STATUS_BASE}/acc_{account_idx}.json"
+                req_u = urllib.request.Request(acc_url, headers={"User-Agent": "StudioCloudWorker"})
+                with urllib.request.urlopen(req_u, timeout=5) as r_u:
+                    a_stat = json.loads(r_u.read().decode("utf-8")) or {}
+                cur_u = int(a_stat.get("usage", 0)) if a_stat.get("quotaDay") == today_nepal else 0
+                urllib.request.urlopen(urllib.request.Request(
+                    acc_url,
+                    data=json.dumps({"usage": cur_u + 1, "quotaDay": today_nepal}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="PATCH"
+                ), timeout=5)
+            except Exception as e_cnt:
+                print(f"⚠️ Notice incrementing Meta quota usage: {e_cnt}")
 
-                # Increment usage for this Meta AI account
-                try:
-                    today_nepal = get_nepal_date_string()
-                    acc_url = f"{FIREBASE_META_STATUS_BASE}/acc_{account_idx}.json"
-                    req_u = urllib.request.Request(acc_url, headers={"User-Agent": "StudioCloudWorker"})
-                    with urllib.request.urlopen(req_u, timeout=5) as r_u:
-                        a_stat = json.loads(r_u.read().decode("utf-8")) or {}
-                    cur_u = int(a_stat.get("usage", 0)) if a_stat.get("quotaDay") == today_nepal else 0
-                    urllib.request.urlopen(urllib.request.Request(
-                        acc_url,
-                        data=json.dumps({"usage": cur_u + 1, "quotaDay": today_nepal}).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
-                        method="PATCH"
-                    ), timeout=5)
-                except Exception as e_cnt:
-                    print(f"⚠️ Notice incrementing Meta quota usage: {e_cnt}")
+            # Server-level device credit deduction
+            if device_id:
+                deduct_server_device_credit(device_id)
 
-                # Server-level device credit deduction
-                if device_id:
-                    deduct_server_device_credit(device_id)
+            # Sync fresh cookies from this session
+            sync_fresh_meta_cookies(page.context, account_idx)
 
-                # Sync fresh cookies from this session
-                sync_fresh_meta_cookies(page.context, account_idx)
+            # Clean up temp file
+            if temp_img_path and os.path.exists(temp_img_path):
+                try: os.remove(temp_img_path)
+                except Exception: pass
 
-                # Clean up temp file
-                if temp_img_path and os.path.exists(temp_img_path):
-                    try: os.remove(temp_img_path)
-                    except Exception: pass
-
-                return True
+            return True
         except Exception as e_dl:
             print(f"❌ Failed to download Meta AI image: {e_dl}")
 
@@ -2123,6 +2196,17 @@ def process_studio_task(slot_id):
                     b = page.locator(f'button:has-text("{btn_text}")').first
                     if b.count() > 0 and b.is_visible():
                         b.click(timeout=1000)
+                except Exception:
+                    pass
+
+            # Reset conversation state: Click New Chat if available so prior images/history don't pollute
+            for nc_sel in ['a[aria-label*="New chat" i]', 'button[aria-label*="New chat" i]', '[data-testid*="new-chat"]']:
+                try:
+                    nc = page.locator(nc_sel).first
+                    if nc.count() > 0 and nc.is_visible():
+                        nc.click(timeout=1500)
+                        time.sleep(1.0)
+                        break
                 except Exception:
                     pass
 
