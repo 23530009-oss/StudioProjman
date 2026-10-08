@@ -78,6 +78,18 @@ def _mask_task(tid):
         return "****"
     return f"{s[:5]}***{s[-4:]}"
 
+def _mask_email(email):
+    if not email or "@" not in str(email):
+        return "[ACCOUNT]"
+    s = str(email).strip()
+    parts = s.split("@", 1)
+    name, domain = parts[0], parts[1]
+    if len(name) <= 2:
+        masked_name = name[:1] + "*"
+    else:
+        masked_name = name[:2] + "***" + name[-1:]
+    return f"{masked_name}@{domain}"
+
 def encrypt_data_aes(plain_text):
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives import padding
@@ -151,9 +163,15 @@ def get_decrypted_meta_pool():
     enc = data.get("enc", "")
     decrypted = decrypt_data_aes(enc)
     parsed = json.loads(decrypted)
-    _META_POOL_TIMESTAMP_MS = int(parsed.get("timestamp_ms", 0))
+    if isinstance(parsed, dict):
+        _META_POOL_TIMESTAMP_MS = int(parsed.get("timestamp_ms", 0))
+        accounts = parsed.get("accounts", [])
+    elif isinstance(parsed, list):
+        _META_POOL_TIMESTAMP_MS = 0
+        accounts = parsed
+    else:
+        accounts = []
 
-    accounts = parsed.get("accounts", [])
     if not accounts:
         raise RuntimeError("No accounts found in decrypted Meta AI pool!")
     return accounts
@@ -404,9 +422,31 @@ def inject_meta_cookies_to_context(context, cookies_data):
         cookie_list = []
 
     if cookie_list:
-        context.add_cookies(cookie_list)
-        print(f"🍪 Injected {len(cookie_list)} Meta AI cookies into browser context.")
-        return len(cookie_list)
+        added = 0
+        for c in cookie_list:
+            if not isinstance(c, dict):
+                continue
+            name = c.get("name")
+            value = c.get("value")
+            if not name or not value:
+                continue
+            cd = {
+                "name": str(name),
+                "value": str(value),
+                "domain": str(c.get("domain", ".meta.ai")),
+                "path": str(c.get("path", "/")),
+                "secure": bool(c.get("secure", True))
+            }
+            s_site = c.get("sameSite") or c.get("same_site")
+            if s_site in ["Strict", "Lax", "None"]:
+                cd["sameSite"] = s_site
+            try:
+                context.add_cookies([cd])
+                added += 1
+            except Exception:
+                pass
+        print(f"🍪 Injected {added}/{len(cookie_list)} Meta AI cookies safely into browser context.")
+        return added
 
     raw_str = cookies_data.get("cookie", "") if isinstance(cookies_data, dict) else str(cookies_data)
     added = 0
@@ -1019,7 +1059,7 @@ def find_and_lock_next_meta_account(slot_id, exclude_indices=None, device_id="")
 
         if chosen_idx is not None:
             atomic_lock_meta_account(chosen_idx, slot_id, device_id)
-            print(f"✅ Meta AI Router: Assigned Account #{chosen_idx + 1} ({accounts[chosen_idx].get('email', '')})")
+            print(f"✅ Meta AI Router: Assigned Account #{chosen_idx + 1} ({_mask_email(accounts[chosen_idx].get('email', ''))})")
             return chosen_idx, get_active_meta_cookie(chosen_idx)
     except Exception as e:
         print(f"❌ Meta AI account selection error: {_safe_err(e)}")
@@ -1197,7 +1237,9 @@ def acquire_execution_account(slot_id, preferred_engine="META_AI", requested_acc
     return None, None, None
 
 
-def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_start, device_id="", switched_from=None, switch_reason=None):
+def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_start, device_id="", switched_from=None, switch_reason=None, active_lock=None):
+    if active_lock is None:
+        active_lock = {"idx": account_idx}
     temp_img_path = None
     if img_b64:
         try:
@@ -1229,10 +1271,12 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             print(f"❌ {err}")
             mark_account_expired(account_idx)
             atomic_unlock_account(account_idx, slot_id)
+            active_lock["idx"] = None
         else:
             print(f"⚠️ Composer not ready within 30s on Account #{int(account_idx)+1} (network or render lag).")
             print(f"🔓 Safely releasing lock on Account #{int(account_idx)+1} so it remains healthy for next time...")
             atomic_unlock_account(account_idx, slot_id)
+            active_lock["idx"] = None
 
         # In-Flight Round-Robin Hot-Swap to next available account
         print(f"⚡ In-Flight Hot-Swap: Querying next eligible account from pool...")
@@ -1243,6 +1287,7 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             switched_from = old_idx
             switch_reason = "Redirected" if auth_err else "Composer Timeout"
             account_idx = new_idx
+            active_lock["idx"] = new_idx
             update_slot_data(slot_id, {
                 "accountIndex": account_idx,
                 "switchedFrom": switched_from,
@@ -1267,6 +1312,8 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
                 print(f"✅ Hot-swap Account #{account_idx+1} composer ready!")
             except Exception as e_swap:
                 print(f"❌ Hot-swap failed on Account #{account_idx+1}: {e_swap}")
+                atomic_unlock_account(account_idx, slot_id)
+                active_lock["idx"] = None
                 update_firebase_result(slot_id, "FAILED", error=f"TRANSIENT_TIMEOUT: Hot-swap Account #{account_idx+1} failed ({e_swap})")
                 update_slot_data(slot_id, {"status": "FAILED"})
                 return False
@@ -1530,6 +1577,7 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
             print(f"⚠️ {err}")
             atomic_unlock_account(account_idx, slot_id)
+            active_lock["idx"] = None
             print(f"⚡ In-Flight Hot-Swap: Querying next eligible account from pool for {_mask_task(slot_id)}...")
             old_idx = account_idx
             new_idx, new_cookie = find_and_lock_next_account(slot_id, exclude_indices=[account_idx], device_id=device_id)
@@ -1538,6 +1586,7 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
                 switched_from = old_idx
                 switch_reason = "Rate Limit Redirect" if is_rate_limit else "Auth Expired Redirect"
                 account_idx = new_idx
+                active_lock["idx"] = new_idx
                 update_slot_data(slot_id, {
                     "accountIndex": account_idx,
                     "switchedFrom": switched_from,
@@ -1558,10 +1607,13 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
                         page, slot_id, account_idx, prompt, img_b64, t_start,
                         device_id=device_id,
                         switched_from=switched_from,
-                        switch_reason=switch_reason
+                        switch_reason=switch_reason,
+                        active_lock=active_lock
                     )
                 except Exception as ex_swap:
                     print(f"⚠️ In-flight swap re-execution failed: {_safe_err(ex_swap)}")
+                    atomic_unlock_account(account_idx, slot_id)
+                    active_lock["idx"] = None
 
         if is_rate_limit:
             time_match = re.search(r"(?:after|until|at|around)\s+([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM|am|pm)?)", assistant_text, re.IGNORECASE)
@@ -1641,38 +1693,56 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         return False
 
     # 2. Attach Photo via input[type="file"]
-    if temp_img_path and os.path.exists(temp_img_path):
-        print("📤 Attaching source photo via input[type=file]...")
-        file_input = page.locator('input[type="file"]').first
+    attached_ok = False
+    if not temp_img_path or not os.path.exists(temp_img_path):
+        err = "FAILED: Cannot generate portrait without source photo (aborted to prevent text hallucination)"
+        print(f"❌ {err}")
+        update_firebase_result(slot_id, "FAILED", error=err, account_idx=account_idx, engine="STUDIO_TURBO")
+        update_slot_data(slot_id, {"status": "FAILED"})
+        return False
 
-        # On Meta AI, the hidden file input is mounted dynamically when the plus button is clicked
-        if file_input.count() == 0:
-            print("Mounting file input via attachment plus button...")
-            add_btn = page.locator(
-                '[data-testid*="attachment"], '
-                '[data-testid*="composer-add"], '
-                'div[data-testid="composer-add-attachment-button-skeleton"], '
-                'svg:has(path[d*="15.126 24"]), '
-                'button[aria-label*="Add" i], '
-                'button[aria-label*="Attach" i]'
-            ).first
-            try:
-                if add_btn.count() > 0:
-                    add_btn.click(force=True, timeout=3000)
-                    time.sleep(0.5)
-            except Exception as e_add:
-                print(f"⚠️ Attachment plus button click notice: {e_add}")
+    print("📤 Attaching source photo via input[type=file]...")
+    file_input = page.locator('input[type="file"]').first
 
+    # On Meta AI, the hidden file input is mounted dynamically when the plus button is clicked
+    if file_input.count() == 0:
+        print("Mounting file input via attachment plus button...")
+        add_btn = page.locator(
+            '[data-testid*="attachment"], '
+            '[data-testid*="composer-add"], '
+            'div[data-testid="composer-add-attachment-button-skeleton"], '
+            'svg:has(path[d*="15.126 24"]), '
+            'button[aria-label*="Add" i], '
+            'button[aria-label*="Attach" i]'
+        ).first
         try:
-            file_input = page.locator('input[type="file"]').first
-            file_input.wait_for(state="attached", timeout=12000)
-            file_input.set_input_files(temp_img_path)
-            print("⏳ Waiting for photo attachment confirmation...")
-            preview_loc = page.locator('img[src^="blob:"], [data-testid*="attachment"], [class*="thumbnail"], button[aria-label*="Remove"]')
-            preview_loc.first.wait_for(state="visible", timeout=15000)
-            print("✅ Photo attached in composer!")
-        except Exception as e:
-            print(f"⚠️ Attachment notice: {e}")
+            if add_btn.count() > 0:
+                add_btn.click(force=True, timeout=3000)
+                time.sleep(0.5)
+        except Exception as e_add:
+            print(f"⚠️ Attachment plus button click notice: {e_add}")
+
+    try:
+        file_input = page.locator('input[type="file"]').first
+        file_input.wait_for(state="attached", timeout=12000)
+        file_input.set_input_files(temp_img_path)
+        print("⏳ Waiting for photo attachment confirmation...")
+        preview_loc = page.locator('img[src^="blob:"], [data-testid*="attachment"], [class*="thumbnail"], button[aria-label*="Remove"]')
+        preview_loc.first.wait_for(state="visible", timeout=15000)
+        attached_ok = True
+        print("✅ Photo attached in composer!")
+    except Exception as e:
+        print(f"❌ Attachment failed: {e}")
+
+    if not attached_ok:
+        err = "STUDIO_ATTACHMENT_FAILED: Source photo upload confirmation timed out (aborted to prevent text hallucination)"
+        print(f"❌ {err}")
+        update_firebase_result(slot_id, "FAILED", error=err, account_idx=account_idx, engine="STUDIO_TURBO")
+        update_slot_data(slot_id, {"status": "FAILED"})
+        if temp_img_path and os.path.exists(temp_img_path):
+            try: os.remove(temp_img_path)
+            except Exception: pass
+        return False
 
     # 3. Locate Active Editor & Insert Studio Passport Prompt
     print("📝 Inserting studio passport prompt into Meta AI composer...")
@@ -1715,6 +1785,22 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         except Exception as e_ins:
             print(f"⚠️ Direct prompt insertion notice: {e_ins}")
 
+    # Capture existing page images before submission to avoid matching old session photos
+    pre_existing_urls = set()
+    try:
+        existing_imgs = page.locator(
+            'img[src*="fbcdn.net"], img[src*="meta.com"], [data-testid*="media"] img, '
+            'article img:not([alt*="avatar"]):not([src^="blob:"]), div[role="main"] img:not([src^="blob:"])'
+        ).all()
+        for ex in existing_imgs:
+            s = ex.get_attribute("src")
+            if s:
+                pre_existing_urls.add(s)
+        if pre_existing_urls:
+            print(f"ℹ️ Found {len(pre_existing_urls)} pre-existing image(s) on page to ignore.")
+    except Exception:
+        pass
+
     # 4. Locate Send Button & Submit
     send_btn = page.locator(
         'button[data-testid="composer-send-button"], '
@@ -1744,6 +1830,8 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     generated_img_url = None
     max_timeout = 115
     last_log = 0
+    is_early_rate_limit = False
+    rate_limit_reason = ""
 
     while time.time() - gen_start < max_timeout:
         elapsed = time.time() - gen_start
@@ -1751,16 +1839,19 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             last_log = int(elapsed)
             print(f"⏳ Waiting for Meta AI... {elapsed:.1f}s elapsed")
 
+        # 1. Reverse traversal of candidate images (newest photos first)
         candidate_imgs = page.locator(
             'img[src*="fbcdn.net"], img[src*="meta.com"], [data-testid*="media"] img, '
             'article img:not([alt*="avatar"]):not([src^="blob:"]), div[role="main"] img:not([src^="blob:"])'
         )
         count = candidate_imgs.count()
         if count > 0:
-            for i in range(count):
+            for i in range(count - 1, -1, -1):
                 img = candidate_imgs.nth(i)
                 if img.is_visible():
                     src = img.get_attribute("src") or ""
+                    if not src or src in pre_existing_urls:
+                        continue
                     box = img.bounding_box()
                     if box and box["width"] > 140 and box["height"] > 140:
                         generated_img_url = src
@@ -1770,7 +1861,42 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
         if generated_img_url:
             break
+
+        # 2. Fast-Break: Early Rate-Limit / Quota Detection (< 3s instead of hanging for 115s!)
+        if elapsed > 2.0:
+            try:
+                body_text = page.locator('div[role="main"], article, div[data-testid="composer-input"], div[class*="error"], div[role="alert"]').all_inner_texts()
+                if body_text:
+                    joined_text = " ".join(body_text).lower()
+                    meta_rl_keywords = [
+                        "reached your limit", "reached the limit", "reached our limit",
+                        "too many requests", "rate limit", "try again later",
+                        "try again in", "limit of messages", "daily limit",
+                        "temporarily unavailable", "quota exceeded", "can't create images right now"
+                    ]
+                    for kw in meta_rl_keywords:
+                        if kw in joined_text:
+                            is_early_rate_limit = True
+                            rate_limit_reason = f"Detected: '{kw}'"
+                            print(f"⚡ Early Meta AI Rate Limit Detected in {elapsed:.1f}s: {kw}! Aborting {max_timeout}s wait loop.")
+                            break
+                    if is_early_rate_limit:
+                        break
+            except Exception:
+                pass
+
         time.sleep(1.0)
+
+    if is_early_rate_limit:
+        mark_meta_account_rate_limited(account_idx)
+        err = f"EXPLICIT_RATE_LIMIT: Meta AI Account #{int(account_idx)+1} rate limited ({rate_limit_reason})"
+        print(f"❌ {err}")
+        update_firebase_result(slot_id, "FAILED", error=err, account_idx=account_idx, engine="STUDIO_TURBO")
+        update_slot_data(slot_id, {"status": "FAILED", "error": err})
+        if temp_img_path and os.path.exists(temp_img_path):
+            try: os.remove(temp_img_path)
+            except Exception: pass
+        return False
 
     gen_duration = time.time() - gen_start
 
@@ -2487,15 +2613,19 @@ def process_studio_task(slot_id):
             return
 
         # Execute Generation
+        active_lock = {"idx": account_idx}
         try:
             execute_chatgpt_generation(
                 page, slot_id, account_idx, prompt, img_b64, t_start,
                 device_id=device_id,
                 switched_from=switched_from,
-                switch_reason=switch_reason
+                switch_reason=switch_reason,
+                active_lock=active_lock
             )
         finally:
-            atomic_unlock_account(account_idx, slot_id)
+            cur_idx = active_lock.get("idx")
+            if cur_idx is not None:
+                atomic_unlock_account(cur_idx, slot_id)
             browser.close()
 
 
