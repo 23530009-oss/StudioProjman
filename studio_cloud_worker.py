@@ -1632,8 +1632,26 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     # 3. Insert Studio Passport Prompt
     print("📝 Inserting studio passport prompt into Meta AI composer...")
     composer.click()
-    page.keyboard.insert_text(prompt)
-    time.sleep(1.0)
+    time.sleep(0.3)
+    pasted_ok = False
+    try:
+        page.evaluate("(text) => navigator.clipboard.writeText(text)", prompt)
+        composer.focus()
+        page.keyboard.press("Control+v")
+        time.sleep(1.2)
+        curr_text = composer.inner_text().strip()
+        if len(curr_text) >= min(len(prompt) - 50, 200):
+            pasted_ok = True
+            print(f"✅ Full prompt pasted cleanly via clipboard ({len(curr_text)}/{len(prompt)} chars)!")
+    except Exception as e_clip:
+        print(f"⚠️ Clipboard paste notice: {e_clip}")
+
+    if not pasted_ok:
+        print("⚠️ Clipboard paste fell back to direct insertion...")
+        composer.click()
+        page.keyboard.press("Control+a")
+        page.keyboard.insert_text(prompt)
+        time.sleep(1.0)
 
     # 4. Locate Send Button & Submit
     send_btn = page.locator('button[aria-label="Send"], button[type="submit"]:has(svg)').first
@@ -1832,7 +1850,10 @@ def process_studio_task(slot_id):
 
     task_engine = acquired_engine
     public_engine = "STUDIO_TURBO" if task_engine == "META_AI" else "STUDIO_PRO"
-    update_slot_data(slot_id, {"accountIndex": account_idx, "engine": public_engine, "status": "PENDING"})
+    patch_fields = {"accountIndex": account_idx, "engine": public_engine}
+    if initial_status != "WARMING":
+        patch_fields["status"] = "PENDING"
+    update_slot_data(slot_id, patch_fields)
 
     if task_engine == "META_AI":
         # ====================================================================
@@ -1883,7 +1904,8 @@ def process_studio_task(slot_id):
                 viewport={"width": 1280, "height": 850},
                 device_scale_factor=1,
                 locale="en-US",
-                timezone_id="Asia/Kathmandu"
+                timezone_id="Asia/Kathmandu",
+                permissions=["clipboard-read", "clipboard-write"]
             )
             context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             inject_meta_cookies_to_context(context, raw_meta_cookie_data)
@@ -2061,7 +2083,8 @@ def process_studio_task(slot_id):
             viewport={"width": 1280, "height": 850},
             device_scale_factor=1,
             locale="en-US",
-            timezone_id="Asia/Kathmandu"
+            timezone_id="Asia/Kathmandu",
+            permissions=["clipboard-read", "clipboard-write"]
         )
         context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
