@@ -1804,7 +1804,7 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     try:
         existing_imgs = page.locator(
             'img[src*="fbcdn.net"], img[src*="meta.com"], [data-testid*="media"] img, '
-            'article img:not([alt*="avatar"]):not([src^="blob:"]), div[role="main"] img:not([src^="blob:"])'
+            'article img:not([alt*="avatar"]), div[role="main"] img, img[src^="blob:"]'
         ).all()
         for ex in existing_imgs:
             s = ex.get_attribute("src")
@@ -1843,7 +1843,7 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     # 5. Monitor Generation & Detect Result Image
     generated_img_url = None
     generated_img_bytes = None
-    max_timeout = 65
+    max_timeout = 85
     last_log = 0
     is_early_rate_limit = False
     rate_limit_reason = ""
@@ -1856,8 +1856,8 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
         # 1. Pure Atomic In-Page JavaScript Extraction (runs in 1ms directly inside Chrome's V8 engine)
         # Eliminates Playwright locator timeouts, ignores React DOM mutations,
-        # filters out the 240x240 spinner & 288x288 input preview,
-        # and targets ONLY the 1600x1600 generated studio portrait (naturalWidth >= 800).
+        # filters out the 240x240 spinner & input photo preview,
+        # and targets ONLY the genuine generated studio portrait.
         scan_result = page.evaluate("""(ignoreUrls) => {
             const ignoreSet = new Set(ignoreUrls);
             const imgs = Array.from(document.querySelectorAll('img'));
@@ -1868,15 +1868,25 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             for (let i = imgs.length - 1; i >= 0; i--) {
                 const img = imgs[i];
                 const src = img.src || img.getAttribute('src') || '';
+                const alt = (img.alt || img.getAttribute('alt') || '').toLowerCase();
                 if (!src || ignoreSet.has(src)) continue;
-                if (src.includes('avatar') || src.includes('profile') || src.includes('logo')) continue;
+                if (src.includes('avatar') || src.includes('profile') || src.includes('logo') || src.includes('orbit')) continue;
+
+                // STRICT REJECTION: Never match user's uploaded input photo
+                if (alt.includes('meta_in') || alt.endsWith('.png') || alt.includes('warm_') || alt.includes('preview') || alt.includes('crop')) {
+                    continue;
+                }
 
                 const nw = img.naturalWidth;
                 const nh = img.naturalHeight;
 
-                // High-resolution studio portrait output (Meta AI renders at 1600x1600 px)
-                // Spinners are 240x240 and user previews are 288x288.
-                if (nw >= 800 && nh >= 800) {
+                // Golden Signature: Meta AI generated images have 'gallery/image_' in alt
+                const hasGallerySig = (alt.includes('gallery') || alt.includes('image_'));
+                const isMetaCdn = (src.includes('fbcdn.net') || src.includes('meta.com') || src.startsWith('blob:') || src.startsWith('data:image/'));
+
+                // High-resolution studio portrait output (Meta AI renders at 1600x1600 or 1408x1584 px)
+                // Spinners are 240x240. User input preview is strictly excluded.
+                if (isMetaCdn && ((hasGallerySig && nw >= 500) || (nw >= 800 && nh >= 800 && !src.startsWith('blob:')))) {
                     return {
                         found: true,
                         src: src,
