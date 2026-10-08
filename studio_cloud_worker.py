@@ -1596,8 +1596,32 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         except Exception as e:
             print(f"⚠️ Error saving temp input photo: {e}")
 
-    # 1. Locate Composer Input
-    composer = page.locator('div[contenteditable="true"]:visible, textarea:visible').first
+    # Dismiss any banners/overlays first (e.g. "Connect apps", "Stay logged out", etc.)
+    for dismiss_sel in [
+        '[data-testid="connect-apps-dismiss-button"]',
+        'button[aria-label="Dismiss"]',
+        'button:has-text("Stay logged out")',
+        'button:has-text("Dismiss")',
+        'button:has-text("Close")',
+        'button:has-text("Not now")',
+        'button:has-text("Got it")',
+        'button:has-text("Maybe later")',
+        'button:has-text("Okay")',
+        'button:has-text("Continue")'
+    ]:
+        try:
+            d_btn = page.locator(dismiss_sel).first
+            if d_btn.count() > 0 and d_btn.is_visible():
+                d_btn.click(timeout=1000)
+        except Exception:
+            pass
+
+    # 1. Locate Composer Input / Area
+    composer = page.locator(
+        'textarea[data-testid="composer-input"], '
+        'div[contenteditable="true"]:visible, '
+        'textarea:visible'
+    ).first
     composer_ready = False
     try:
         composer.wait_for(state="visible", timeout=25000)
@@ -1615,11 +1639,31 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             except Exception: pass
         return False
 
-    # 2. Attach Photo via hidden input[type="file"]
+    # 2. Attach Photo via input[type="file"]
     if temp_img_path and os.path.exists(temp_img_path):
         print("📤 Attaching source photo via input[type=file]...")
         file_input = page.locator('input[type="file"]').first
+
+        # On Meta AI, the hidden file input is mounted dynamically when the plus button is clicked
+        if file_input.count() == 0:
+            print("Mounting file input via attachment plus button...")
+            add_btn = page.locator(
+                '[data-testid*="attachment"], '
+                '[data-testid*="composer-add"], '
+                'div[data-testid="composer-add-attachment-button-skeleton"], '
+                'svg:has(path[d*="15.126 24"]), '
+                'button[aria-label*="Add" i], '
+                'button[aria-label*="Attach" i]'
+            ).first
+            try:
+                if add_btn.count() > 0:
+                    add_btn.click(force=True, timeout=3000)
+                    time.sleep(0.5)
+            except Exception as e_add:
+                print(f"⚠️ Attachment plus button click notice: {e_add}")
+
         try:
+            file_input = page.locator('input[type="file"]').first
             file_input.wait_for(state="attached", timeout=12000)
             file_input.set_input_files(temp_img_path)
             print("⏳ Waiting for photo attachment confirmation...")
@@ -1629,17 +1673,31 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         except Exception as e:
             print(f"⚠️ Attachment notice: {e}")
 
-    # 3. Insert Studio Passport Prompt
+    # 3. Locate Active Editor & Insert Studio Passport Prompt
     print("📝 Inserting studio passport prompt into Meta AI composer...")
-    composer.click()
-    time.sleep(0.3)
+    # Note: When a photo is attached, Meta AI hydrates the full Lexical rich-text editor (contenteditable="true")
+    active_editor = page.locator(
+        'div[contenteditable="true"]:visible, '
+        '[data-testid="composer-input"][contenteditable="true"]:visible, '
+        'textarea[data-testid="composer-input"]:visible, '
+        'textarea:visible'
+    ).first
+
+    try:
+        active_editor.wait_for(state="visible", timeout=12000)
+        active_editor.click(force=True)
+        time.sleep(0.3)
+    except Exception as e_ed:
+        print(f"⚠️ Editor focus notice: {e_ed}")
+
     pasted_ok = False
     try:
         page.evaluate("(text) => navigator.clipboard.writeText(text)", prompt)
-        composer.focus()
+        active_editor.focus()
         page.keyboard.press("Control+v")
         time.sleep(1.2)
-        curr_text = composer.inner_text().strip()
+        is_textarea = active_editor.evaluate('e => e.tagName') == 'TEXTAREA'
+        curr_text = active_editor.input_value().strip() if is_textarea else active_editor.inner_text().strip()
         if len(curr_text) >= min(len(prompt) - 50, 200):
             pasted_ok = True
             print(f"✅ Full prompt pasted cleanly via clipboard ({len(curr_text)}/{len(prompt)} chars)!")
@@ -1648,17 +1706,24 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
     if not pasted_ok:
         print("⚠️ Clipboard paste fell back to direct insertion...")
-        composer.click()
-        page.keyboard.press("Control+a")
-        page.keyboard.insert_text(prompt)
-        time.sleep(1.0)
+        try:
+            active_editor.click(force=True)
+            page.keyboard.press("Control+a")
+            page.keyboard.insert_text(prompt)
+            time.sleep(1.0)
+        except Exception as e_ins:
+            print(f"⚠️ Direct prompt insertion notice: {e_ins}")
 
     # 4. Locate Send Button & Submit
-    send_btn = page.locator('button[aria-label="Send"], button[type="submit"]:has(svg)').first
+    send_btn = page.locator(
+        'button[data-testid="composer-send-button"], '
+        'button[aria-label="Send"], '
+        'button[type="submit"]:has(svg)'
+    ).first
     send_ready = False
     try:
-        send_btn.wait_for(state="visible", timeout=6000)
-        for _ in range(15):
+        send_btn.wait_for(state="visible", timeout=8000)
+        for _ in range(20):
             if send_btn.is_enabled():
                 send_ready = True
                 break
@@ -1668,7 +1733,7 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
     gen_start = time.time()
     if send_ready:
-        send_btn.click(timeout=3000)
+        send_btn.click(force=True, timeout=3000)
         print("⚡ Clicked Send button!")
     else:
         page.keyboard.press("Enter")
