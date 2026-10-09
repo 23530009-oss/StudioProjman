@@ -889,7 +889,26 @@ def find_and_lock_next_account(slot_id, exclude_indices=None, device_id=""):
 
         if chosen_idx is not None:
             atomic_lock_account(chosen_idx, slot_id, device_id)
-            print(f"✅ Self-Healing: Switched to Account #{chosen_idx + 1}")
+            # Optimistic Concurrency Verification (Read-Back Guard)
+            time.sleep(0.12)
+            try:
+                chk_req = urllib.request.Request(f"{FIREBASE_STATUS_BASE}/acc_{chosen_idx}.json", headers={"User-Agent": "StudioCloudWorker"})
+                with urllib.request.urlopen(chk_req, timeout=4) as chk_resp:
+                    chk_data = json.loads(chk_resp.read().decode("utf-8") or "{}")
+                    cur_booked_by = str(chk_data.get("bookedBy", ""))
+                    expected_token = f"cloud_runner_{slot_id}"
+                    if cur_booked_by and not cur_booked_by.startswith(expected_token):
+                        print(f"⚠️ Concurrency Collision (VIP): Account #{chosen_idx + 1} was simultaneously claimed by {cur_booked_by}! Re-routing...")
+                        if exclude_indices is None:
+                            exclude_indices = set()
+                        else:
+                            exclude_indices = set(exclude_indices)
+                        exclude_indices.add(chosen_idx)
+                        return find_and_lock_next_account(slot_id, exclude_indices=exclude_indices, device_id=device_id)
+            except Exception as e_rb:
+                print(f"Notice on VIP lock read-back verification: {e_rb}")
+
+            print(f"✅ Self-Healing: Assigned & Verified Account #{chosen_idx + 1}")
             return chosen_idx, get_active_cookie(chosen_idx)
     except Exception as e:
         print(f"❌ Self-Healing error: {_safe_err(e)}")
@@ -1059,7 +1078,22 @@ def find_and_lock_next_meta_account(slot_id, exclude_indices=None, device_id="")
 
         if chosen_idx is not None:
             atomic_lock_meta_account(chosen_idx, slot_id, device_id)
-            print(f"✅ Meta AI Router: Assigned Account #{chosen_idx + 1} ({_mask_email(accounts[chosen_idx].get('email', ''))})")
+            # Optimistic Concurrency Verification (Read-Back Guard)
+            time.sleep(0.12)
+            try:
+                chk_req = urllib.request.Request(f"{FIREBASE_META_STATUS_BASE}/acc_{chosen_idx}.json", headers={"User-Agent": "StudioCloudWorker"})
+                with urllib.request.urlopen(chk_req, timeout=4) as chk_resp:
+                    chk_data = json.loads(chk_resp.read().decode("utf-8") or "{}")
+                    cur_booked_by = str(chk_data.get("bookedBy", ""))
+                    expected_token = f"cloud_runner_{slot_id}"
+                    if cur_booked_by and not cur_booked_by.startswith(expected_token):
+                        print(f"⚠️ Concurrency Collision (Meta): Account #{chosen_idx + 1} was simultaneously claimed by {cur_booked_by}! Re-routing...")
+                        exclude_indices.add(chosen_idx)
+                        return find_and_lock_next_meta_account(slot_id, exclude_indices=exclude_indices, device_id=device_id)
+            except Exception as e_rb:
+                print(f"Notice on Meta lock read-back verification: {e_rb}")
+
+            print(f"✅ Meta AI Router: Assigned & Verified Account #{chosen_idx + 1} ({_mask_email(accounts[chosen_idx].get('email', ''))})")
             return chosen_idx, get_active_meta_cookie(chosen_idx)
     except Exception as e:
         print(f"❌ Meta AI account selection error: {_safe_err(e)}")
@@ -1799,8 +1833,9 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         except Exception as e_ins:
             print(f"⚠️ Direct prompt insertion notice: {e_ins}")
 
-    # Capture existing page images before submission to avoid matching old session photos
+    # Capture existing page images and sidebar threads before submission to avoid matching old session data
     pre_existing_urls = set()
+    pre_existing_threads = set()
     try:
         existing_imgs = page.locator(
             'img[src*="fbcdn.net"], img[src*="meta.com"], [data-testid*="media"] img, '
@@ -1812,6 +1847,17 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
                 pre_existing_urls.add(s)
         if pre_existing_urls:
             print(f"ℹ️ Found {len(pre_existing_urls)} pre-existing image(s) on page to ignore.")
+    except Exception:
+        pass
+
+    try:
+        sb_threads = page.locator('nav a[href*="/prompt/"], div[role="navigation"] a[href*="/prompt/"]').all()
+        for th in sb_threads:
+            th_href = th.get_attribute("href")
+            if th_href:
+                pre_existing_threads.add(th_href)
+        if pre_existing_threads:
+            print(f"ℹ️ Found {len(pre_existing_threads)} pre-existing sidebar thread(s) to ignore.")
     except Exception:
         pass
 
@@ -1841,21 +1887,32 @@ def execute_meta_ai_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         print("⚡ Pressed Enter fallback!")
 
     # Ensure transition into the active conversation thread
-    time.sleep(1.5)
+    time.sleep(1.2)
     if "/prompt/" not in page.url:
         try:
-            page.wait_for_url("**/prompt/**", timeout=5000)
+            page.wait_for_url("**/prompt/**", timeout=4000)
             print(f"🔗 URL transitioned to active thread: {page.url}")
         except Exception:
             try:
-                top_thread = page.locator('nav a[href*="/prompt/"], div[role="navigation"] a[href*="/prompt/"], a[aria-current="page"]').first
-                if top_thread.count() > 0:
-                    print("🔗 Entering active conversation thread in sidebar...")
-                    top_thread.click(force=True, timeout=3000)
-                    time.sleep(1.5)
-                    print(f"🔗 Active thread URL: {page.url}")
+                new_thread = None
+                sb_links = page.locator('nav a[href*="/prompt/"], div[role="navigation"] a[href*="/prompt/"]').all()
+                for link in sb_links:
+                    href = link.get_attribute("href")
+                    if href and href not in pre_existing_threads:
+                        new_thread = link
+                        print(f"🔗 Identified brand new conversation thread in sidebar: {href}")
+                        break
+
+                if new_thread:
+                    new_thread.click(force=True, timeout=3000)
+                    time.sleep(1.2)
+                    print(f"🔗 Navigated to new active thread URL: {page.url}")
+                elif "/prompt/" in page.url:
+                    print(f"🔗 Already on active thread URL: {page.url}")
+                else:
+                    print("ℹ️ Direct Viewport Mode: Monitoring active DOM canvas directly!")
             except Exception as e_th:
-                print(f"Notice opening active thread: {e_th}")
+                print(f"Notice handling thread transition: {e_th}")
 
     # 5. Monitor Generation & Detect Result Image
     generated_img_url = None
