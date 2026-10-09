@@ -1060,6 +1060,88 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             )
             urllib.request.urlopen(req_patch, timeout=5)
             print(f"📊 Incremented Account #{int(account_idx)+1} usage to {new_usage} for {today_nepal}")
+
+            # 🔍 Automatic Inline Post-Photo Quota Introspection Probe
+            max_images = 3
+            try:
+                req_all = urllib.request.Request(f"{FIREBASE_STATUS_BASE}.json", headers={"User-Agent": "StudioCloudWorker"})
+                with urllib.request.urlopen(req_all, timeout=4) as r_all:
+                    all_stat = json.loads(r_all.read().decode("utf-8")) or {}
+                    max_images = int(all_stat.get("maxImagesPerAccount", all_stat.get("max_images_per_account", 3)))
+            except Exception:
+                pass
+
+            if new_usage >= max_images:
+                print(f"🔍 Account #{int(account_idx)+1} reached capacity ({new_usage}/{max_images}). Running live inline quota probe...")
+                try:
+                    attach_sel = '[data-testid="composer-plus-btn"], button[aria-label*="Add files" i], button[aria-label*="attach" i], #composer-plus-btn'
+                    plus_btn = page.locator(attach_sel).first
+                    if plus_btn.count() > 0 and plus_btn.is_visible():
+                        plus_btn.click(timeout=3000)
+                        page.wait_for_timeout(800)
+                        img_elem = page.locator('text="Create image"').first
+                        if img_elem.count() > 0:
+                            parent_text = img_elem.locator('..').inner_text()
+                            try:
+                                page.keyboard.press("Escape")
+                            except Exception:
+                                pass
+
+                            p_lower = parent_text.lower()
+                            explicit_zero = any(k in p_lower for k in ["0 images left", "0 left", "no images left", "zero images left"])
+                            left_match = re.search(r"(\d+)\s*(?:images?)?\s*left", p_lower)
+                            time_match = re.search(r"until\s+([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM|am|pm)?)", parent_text, re.IGNORECASE)
+                            reset_time_str = time_match.group(1).strip() if time_match else ""
+
+                            if explicit_zero:
+                                is_blocked = True
+                                remaining_detected = 0
+                            elif left_match:
+                                remaining_detected = int(left_match.group(1))
+                                is_blocked = (remaining_detected == 0)
+                            elif reset_time_str and any(k in p_lower for k in ["limit", "quota", "reached", "exceeded"]):
+                                is_blocked = True
+                                remaining_detected = 0
+                            else:
+                                is_blocked = False
+                                remaining_detected = None
+
+                            if is_blocked:
+                                print(f"🔒 Account #{int(account_idx)+1} confirmed rate-limited until: {reset_time_str or 'Next cycle'}")
+                                if reset_time_str:
+                                    mark_account_rate_limited(account_idx, reset_time_str)
+                            else:
+                                # Unblocked / Bonus capacity granted by OpenAI!
+                                print(f"🎉 Account #{int(account_idx)+1} is unblocked! Restoring bonus quota...")
+                                if remaining_detected is not None and remaining_detected > 0:
+                                    restored_usage = max(0, max_images - remaining_detected)
+                                else:
+                                    restored_usage = max(0, new_usage - 1)
+
+                                bonus_patch = {
+                                    "usage": restored_usage,
+                                    "resetTime": "",
+                                    "isExpired": False
+                                }
+                                req_b = urllib.request.Request(
+                                    f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json",
+                                    data=json.dumps(bonus_patch).encode("utf-8"),
+                                    headers={"Content-Type": "application/json"},
+                                    method="PATCH"
+                                )
+                                urllib.request.urlopen(req_b, timeout=4)
+                                print(f"✅ Restored Account #{int(account_idx)+1} to usage={restored_usage} (+1 bonus image available)")
+                                send_whatsapp_alert(
+                                    f"🎉 *JB STUDIO - BONUS QUOTA RESTORED!* ⚡\n"
+                                    f"══════════════════════════════\n"
+                                    f"👤 *Account:* #{int(account_idx)+1}\n"
+                                    f"🟢 *Status:* Unblocked! OpenAI granted bonus capacity\n"
+                                    f"🎁 *Bonus:* +1 Photo restored (Usage: {restored_usage}/{max_images})\n"
+                                    f"══════════════════════════════\n"
+                                    f"Account is immediately active and ready for customer photos!"
+                                )
+                except Exception as e_inline:
+                    print(f"⚠️ Inline quota probe note: {_safe_err(e_inline)}")
         except Exception as e_usage:
             print(f"⚠️ Failed to increment account usage: {_safe_err(e_usage)}")
         print(f"🎉 Slot {_mask_task(slot_id)} completed successfully in {time.time() - t_start:.2f}s!")
