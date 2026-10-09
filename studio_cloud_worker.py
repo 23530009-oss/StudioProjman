@@ -634,81 +634,98 @@ def find_and_lock_next_account(slot_id, exclude_indices=None, device_id=""):
 
     print(f"🔄 Self-Healing: Finding next eligible account (excluding: {exclude_indices})...")
     today_nepal = get_nepal_date_string()
-    now_ms = int(time.time() * 1000)
+    start_wait = time.time()
+    max_wait_seconds = 45
 
-    try:
-        # Fetch current pool status
-        req = urllib.request.Request(f"{FIREBASE_STATUS_BASE}.json", headers={"User-Agent": "StudioCloudWorker"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            status_data = json.loads(resp.read().decode("utf-8")) or {}
+    while True:
+        now_ms = int(time.time() * 1000)
+        try:
+            # Fetch current pool status
+            req = urllib.request.Request(f"{FIREBASE_STATUS_BASE}.json", headers={"User-Agent": "StudioCloudWorker"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                status_data = json.loads(resp.read().decode("utf-8")) or {}
 
-        max_images = int(status_data.get("maxImagesPerAccount", status_data.get("max_images_per_account", 3)))
-        accounts = get_decrypted_pool()
-        total_accounts = len(accounts)
+            max_images = int(status_data.get("maxImagesPerAccount", status_data.get("max_images_per_account", 3)))
+            accounts = get_decrypted_pool()
+            total_accounts = len(accounts)
 
-        candidates = []
+            candidates = []
+            busy_count = 0
 
-        for i in range(total_accounts):
-            if i in exclude_indices:
-                continue
-            acc_info = status_data.get(f"acc_{i}", {})
-            if acc_info.get("isExpired", False):
-                continue
-            
-            # Check booking lease
-            booked_until = int(acc_info.get("bookedUntil", 0))
-            booked_by = acc_info.get("bookedBy", "")
-            if booked_until > now_ms:
-                is_our_slot = booked_by.startswith(f"cloud_runner_{slot_id}")
-                is_pre_reserved = bool(device_id and (booked_by == f"cloud_runner_{device_id}" or booked_by.startswith(f"cloud_runner_{device_id}_p")))
-                if not (is_our_slot or is_pre_reserved):
+            for i in range(total_accounts):
+                if i in exclude_indices:
                     continue
-                if not is_our_slot and acc_info.get("isBusy", False):
+                acc_info = status_data.get(f"acc_{i}", {})
+                if acc_info.get("isExpired", False):
                     continue
+                
+                # Check booking lease
+                booked_until = int(acc_info.get("bookedUntil", 0))
+                booked_by = acc_info.get("bookedBy", "")
+                if booked_until > now_ms:
+                    is_our_slot = booked_by.startswith(f"cloud_runner_{slot_id}")
+                    is_pre_reserved = bool(device_id and (booked_by == f"cloud_runner_{device_id}" or booked_by.startswith(f"cloud_runner_{device_id}_p")))
+                    if not (is_our_slot or is_pre_reserved):
+                        busy_count += 1
+                        continue
+                    if not is_our_slot and acc_info.get("isBusy", False):
+                        busy_count += 1
+                        continue
 
-            q_day = acc_info.get("quotaDay", "")
-            usage = int(acc_info.get("usage", 0)) if q_day == today_nepal else 0
-            remaining = max(0, max_images - usage)
+                q_day = acc_info.get("quotaDay", "")
+                usage = int(acc_info.get("usage", 0)) if q_day == today_nepal else 0
+                remaining = max(0, max_images - usage)
 
-            # ⏰ Autonomous Cooldown Expiry: Check if rate limit resetTime has passed
-            reset_time_str = acc_info.get("resetTime", "")
-            if remaining == 0 and reset_time_str:
-                rl_time = acc_info.get("lastBlockedProbeTime") or acc_info.get("rateLimitedAt", 0)
-                if has_reset_time_passed(reset_time_str, rl_time):
-                    usage = 0
-                    remaining = max_images
-                    try:
-                        acc_patch = {"resetTime": "", "usage": 0}
-                        req_p = urllib.request.Request(
-                            f"{FIREBASE_STATUS_BASE}/acc_{i}.json",
-                            data=json.dumps(acc_patch).encode("utf-8"),
-                            headers={"Content-Type": "application/json"},
-                            method="PATCH"
-                        )
-                        urllib.request.urlopen(req_p, timeout=5)
-                        print(f"⏰ Auto-Cooldown: Account #{i + 1} resetTime '{reset_time_str}' has passed! Restored quota to {max_images}/{max_images}.")
-                    except Exception as e_cd:
-                        print(f"⚠️ Failed to patch auto-cooldown for acc_{i}: {_safe_err(e_cd)}")
+                # ⏰ Autonomous Cooldown Expiry: Check if rate limit resetTime has passed
+                reset_time_str = acc_info.get("resetTime", "")
+                if remaining == 0 and reset_time_str:
+                    rl_time = acc_info.get("lastBlockedProbeTime") or acc_info.get("rateLimitedAt", 0)
+                    if has_reset_time_passed(reset_time_str, rl_time):
+                        usage = 0
+                        remaining = max_images
+                        try:
+                            acc_patch = {"resetTime": "", "usage": 0}
+                            req_p = urllib.request.Request(
+                                f"{FIREBASE_STATUS_BASE}/acc_{i}.json",
+                                data=json.dumps(acc_patch).encode("utf-8"),
+                                headers={"Content-Type": "application/json"},
+                                method="PATCH"
+                            )
+                            urllib.request.urlopen(req_p, timeout=5)
+                            print(f"⏰ Auto-Cooldown: Account #{i + 1} resetTime '{reset_time_str}' has passed! Restored quota to {max_images}/{max_images}.")
+                        except Exception as e_cd:
+                            print(f"⚠️ Failed to patch auto-cooldown for acc_{i}: {_safe_err(e_cd)}")
 
-            if remaining > 0:
-                candidates.append((remaining, i))
+                if remaining > 0:
+                    candidates.append((remaining, i))
 
-        # Group candidates by maximum remaining quota and choose randomly among the top tier
-        if candidates:
-            candidates.sort(key=lambda x: -x[0])
-            max_rem = candidates[0][0]
-            best_candidates = [idx for rem, idx in candidates if rem == max_rem]
-            import random
-            chosen_idx = random.choice(best_candidates)
-        else:
-            chosen_idx = None
+            # Group candidates by maximum remaining quota and choose randomly among the top tier
+            if candidates:
+                candidates.sort(key=lambda x: -x[0])
+                max_rem = candidates[0][0]
+                best_candidates = [idx for rem, idx in candidates if rem == max_rem]
+                import random
+                chosen_idx = random.choice(best_candidates)
+            else:
+                chosen_idx = None
 
-        if chosen_idx is not None:
-            atomic_lock_account(chosen_idx, slot_id, device_id)
-            print(f"✅ Self-Healing: Switched to Account #{chosen_idx + 1}")
-            return chosen_idx, get_active_cookie(chosen_idx)
-    except Exception as e:
-        print(f"❌ Self-Healing error: {_safe_err(e)}")
+            if chosen_idx is not None:
+                atomic_lock_account(chosen_idx, slot_id, device_id)
+                print(f"✅ Self-Healing: Switched to Account #{chosen_idx + 1}")
+                return chosen_idx, get_active_cookie(chosen_idx)
+
+            # Concurrency Queue: If accounts are busy with other concurrent jobs, wait and poll
+            elapsed = time.time() - start_wait
+            if busy_count > 0 and elapsed < max_wait_seconds:
+                wait_step = min(4, max(2, int(max_wait_seconds - elapsed)))
+                print(f"⏳ Concurrency Queue: {busy_count} account(s) currently busy. Holding task in queue (waited {int(elapsed)}s/{max_wait_seconds}s, rechecking in {wait_step}s)...")
+                time.sleep(wait_step)
+                continue
+            else:
+                break
+        except Exception as e:
+            print(f"❌ Self-Healing error: {_safe_err(e)}")
+            break
 
     return None, ""
 
