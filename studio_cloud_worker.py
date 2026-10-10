@@ -834,23 +834,6 @@ def check_quota_and_restore_bonus(page, context, account_idx, slot_id=None):
             return False
 
         parent_text = img_elem.locator('..').inner_text()
-
-        # 📸 Live Visual Verification: Capture screenshot of the open Plus menu
-        try:
-            ss_bytes = page.screenshot()
-            ss_b64 = base64.b64encode(ss_bytes).decode('ascii')
-            urllib.request.urlopen(urllib.request.Request(
-                f"{FIREBASE_STATUS_BASE}/lastProbeScreenshot.json",
-                data=json.dumps({"accountIndex": account_idx, "screenshot": ss_b64, "timestamp": int(time.time()*1000), "menuText": parent_text}).encode('utf-8'),
-                headers={"Content-Type": "application/json"},
-                method="PUT"
-            ), timeout=10)
-            if slot_id:
-                update_slot_data(slot_id, {"probeScreenshot": ss_b64})
-            print(f"📸 Captured and saved live probe screenshot for Account #{account_idx + 1}")
-        except Exception as e_ss:
-            print(f"⚠️ Screenshot capture note: {_safe_err(e_ss)}")
-
         try:
             page.keyboard.press("Escape")
         except Exception:
