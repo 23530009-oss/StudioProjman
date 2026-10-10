@@ -268,15 +268,12 @@ def get_active_cookie(account_idx=None):
             fresh_enc = stat_obj.get("freshCookie", "")
             last_sync = int(stat_obj.get("lastCookieSync", 0))
 
-            # CRITICAL GUARD: Only use freshCookie if it was synced AFTER the last PC harvest!
-            # If the pool in cookie_pool.json was updated more recently on PC, the pool cookie is newer!
-            if fresh_enc and isinstance(fresh_enc, str) and len(fresh_enc) > 30 and (last_sync >= _POOL_TIMESTAMP_MS):
+            # 1. ALWAYS prioritize fresh rotated cookie in Firebase status
+            if fresh_enc and isinstance(fresh_enc, str) and len(fresh_enc) > 30:
                 decrypted = decrypt_data_aes(fresh_enc)
                 if decrypted and ("session-token" in decrypted or "oai-did" in decrypted):
                     print(f"🎯 Assigned Account #{idx + 1} (Using Fresh Synced Cookie 🔄, synced: {last_sync})")
                     return decrypted
-            elif fresh_enc and last_sync < _POOL_TIMESTAMP_MS:
-                print(f"ℹ️ Account #{idx + 1} freshCookie is older than PC harvest ({last_sync} < {_POOL_TIMESTAMP_MS}). Prioritizing PC harvest cookie! 📦")
     except Exception as e_fresh:
         print(f"ℹ️ Account #{idx + 1} fresh cookie check fallback: {_safe_err(e_fresh)}")
 
@@ -796,6 +793,142 @@ def check_login_or_auth_expired(page):
     return None
 
 
+def check_quota_and_restore_bonus(page, context, account_idx, slot_id=None):
+    """
+    Unified Quota Inspector & Fresh Cookie Refresher:
+    1. Clicks Plus (+) icon on ChatGPT.
+    2. Inspects text next to 'Create image':
+       - If BOTH '0' AND 'until [time]' exist -> Genuine Cooldown, set resetTime, WhatsApp alert.
+       - Direct Else -> Decrement usage (usage = max(0, usage - 1)), unlock, WhatsApp alert.
+    3. Always captures rotated session cookies and syncs them to Firebase freshCookie!
+    """
+    try:
+        # Dismiss any popups
+        for btn_text in ["Stay logged out", "Dismiss", "Close", "Not now", "Got it", "Maybe later", "Okay", "Continue"]:
+            try:
+                b = page.locator(f'button:has-text("{btn_text}")').first
+                if b.count() > 0 and b.is_visible():
+                    b.click(timeout=1000)
+            except Exception:
+                pass
+
+        # Wait for composer
+        page.wait_for_selector('#prompt-textarea, [contenteditable="true"]', timeout=20000)
+
+        # Click Plus (+) button
+        plus_btn = page.locator('[data-testid="composer-plus-btn"], button[aria-label*="Add files" i], button[aria-label*="attach" i], #composer-plus-btn').first
+        if plus_btn.count() == 0:
+            print(f"⚠️ Plus button not found on Account #{account_idx + 1}")
+            return False
+        plus_btn.click(timeout=5000)
+        page.wait_for_timeout(1000)
+
+        # Locate 'Create image'
+        img_elem = page.locator('text="Create image"').first
+        if img_elem.count() == 0:
+            page.wait_for_timeout(1500)
+            img_elem = page.locator('text="Create image"').first
+
+        if img_elem.count() == 0:
+            print(f"⚠️ 'Create image' not visible in Plus menu for Account #{account_idx + 1}")
+            return False
+
+        parent_text = img_elem.locator('..').inner_text()
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+        print(f"📋 Account #{account_idx + 1} Plus Menu Text: {repr(parent_text)}")
+        p_lower = parent_text.lower()
+
+        # 1. Check for reset time after 'until'
+        time_match = re.search(r"until\s+([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM|am|pm)?)", parent_text, re.IGNORECASE)
+        reset_time_str = time_match.group(1).strip() if time_match else ""
+
+        # 2. Check for 0 (matches '0 images left', '0 left', etc.)
+        has_zero = bool(re.search(r"(?<!\d)0\s*(?:images?)?\s*left", p_lower)) or ("0 left" in p_lower) or ("0 images left" in p_lower)
+
+        # Genuine Block Check: MUST have BOTH '0' AND 'until [time]'
+        if has_zero and reset_time_str:
+            print(f"🔒 Account #{account_idx + 1} confirmed in cooldown by OpenAI until: {reset_time_str}")
+            mark_account_rate_limited(account_idx, reset_time_str)
+            if slot_id:
+                atomic_unlock_account(account_idx, slot_id)
+                update_slot_data(slot_id, {"status": "COMPLETED", "result": "BLOCKED", "resetTime": reset_time_str})
+
+            # Always sync fresh rotated cookies to Firebase!
+            sync_fresh_cookies(context, account_idx)
+
+            send_whatsapp_alert(
+                f"🔒 *JB STUDIO - COOLDOWN CONFIRMED*\n"
+                f"══════════════════════════════\n"
+                f"👤 *Account:* #{account_idx + 1}\n"
+                f"🚫 *Status:* Confirmed Rate-Limited (0 left)\n"
+                f"⏰ *Reset Time:* {reset_time_str}\n"
+                f"══════════════════════════════\n"
+                f"Studio apps will automatically use next available account."
+            )
+            return True
+        else:
+            # DIRECT ELSE: Any other situation -> Deduct 1 from usage (+1 bonus photo)
+            print(f"🎉 Account #{account_idx + 1} is NOT blocked. Restoring +1 bonus quota!")
+            cur_usage = 0
+            try:
+                req_stat = urllib.request.Request(f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json", headers={"User-Agent": "StudioCloudWorker"})
+                with urllib.request.urlopen(req_stat, timeout=5) as r_s:
+                    st = json.loads(r_s.read().decode("utf-8")) or {}
+                    cur_usage = int(st.get("usage", 0))
+            except Exception:
+                pass
+
+            new_usage = max(0, cur_usage - 1)
+            bonus_patch = {
+                "usage": new_usage,
+                "bookedBy": "",
+                "bookedUntil": 0,
+                "isExpired": False,
+                "resetTime": ""
+            }
+            req_b = urllib.request.Request(
+                f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json",
+                data=json.dumps(bonus_patch).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="PATCH"
+            )
+            with urllib.request.urlopen(req_b, timeout=5):
+                pass
+
+            if slot_id:
+                atomic_unlock_account(account_idx, slot_id)
+                update_slot_data(slot_id, {"status": "COMPLETED", "result": "BONUS_AWARDED", "newUsage": new_usage})
+
+            # Always sync fresh rotated cookies to Firebase!
+            sync_fresh_cookies(context, account_idx)
+
+            send_whatsapp_alert(
+                f"🎉 *JB STUDIO - BONUS QUOTA RESTORED!* ⚡\n"
+                f"══════════════════════════════\n"
+                f"👤 *Account:* #{account_idx + 1}\n"
+                f"🟢 *Status:* Unblocked! (+1 Photo Added)\n"
+                f"🎁 *Usage:* Reduced to {new_usage}\n"
+                f"══════════════════════════════\n"
+                f"Account is immediately active and ready for customer photos!"
+            )
+            return True
+    except Exception as e_probe:
+        auth_err = check_login_or_auth_expired(page)
+        if auth_err:
+            print(f"❌ Account #{account_idx + 1} session expired during probe: {auth_err}")
+            mark_account_expired(account_idx)
+        else:
+            print(f"⚠️ Quota probe error: {_safe_err(e_probe)}")
+        if slot_id:
+            atomic_unlock_account(account_idx, slot_id)
+            update_slot_data(slot_id, {"status": "FAILED", "error": auth_err or str(e_probe)})
+        return False
+
+
 def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_start, device_id="", switched_from=None, switch_reason=None):
     task_ctx = account_idx if isinstance(account_idx, TaskExecutionContext) else TaskExecutionContext(account_idx, slot_id)
     current_acc_idx = task_ctx.active_idx
@@ -1123,6 +1256,26 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         except Exception as e_usage:
             print(f"⚠️ Failed to increment account usage: {_safe_err(e_usage)}")
         print(f"🎉 Slot {_mask_task(slot_id)} completed successfully in {time.time() - t_start:.2f}s!")
+
+        # Dynamic Quota Auto-Trigger: When account hits 0 remaining, wait 1 minute & inspect
+        should_auto_probe = False
+        try:
+            req_all = urllib.request.Request(f"{FIREBASE_STATUS_BASE}.json", headers={"User-Agent": "StudioCloudWorker"})
+            with urllib.request.urlopen(req_all, timeout=5) as r_all:
+                all_stat = json.loads(r_all.read().decode("utf-8")) or {}
+                max_images = int(all_stat.get("maxImagesPerAccount", all_stat.get("max_images_per_account", 3)))
+            if new_usage >= max_images:
+                should_auto_probe = True
+        except Exception:
+            if new_usage >= 3:
+                should_auto_probe = True
+
+        if should_auto_probe:
+            print(f"⏳ Account #{int(current_acc_idx)+1} reached quota limit ({new_usage}/{max_images}).")
+            print(f"⏳ Waiting 1 minute (60s) for OpenAI quota state sync before auto-probe...")
+            time.sleep(60)
+            check_quota_and_restore_bonus(page, page.context, current_acc_idx, slot_id=slot_id)
+
         return True
     else:
         # 🚀 IN-FLIGHT LIVE HOT-SWAP: If rate-limited or auth-expired, swap to next account and retry in same session!
@@ -1440,173 +1593,7 @@ def process_studio_task(slot_id):
         # Handle Quota Verification Probe
         if is_quota_probe:
             print(f"🔍 Running Quota Verification Probe on Account #{account_idx + 1}...")
-            try:
-                # Dismiss popups first
-                for btn_text in ["Stay logged out", "Dismiss", "Close", "Not now", "Got it", "Maybe later", "Okay", "Continue"]:
-                    try:
-                        b = page.locator(f'button:has-text("{btn_text}")').first
-                        if b.count() > 0 and b.is_visible():
-                            b.click(timeout=1000)
-                    except Exception:
-                        pass
-
-                # Wait for composer
-                composer_ready = False
-                try:
-                    page.wait_for_selector('#prompt-textarea, [contenteditable="true"]', timeout=25000)
-                    composer_ready = True
-                except Exception:
-                    pass
-
-                if not composer_ready:
-                    auth_err = check_login_or_auth_expired(page)
-                    if auth_err:
-                        print(f"❌ Account #{account_idx + 1} session expired during probe: {auth_err}")
-                        mark_account_expired(account_idx)
-                    else:
-                        print(f"⚠️ Composer not ready on Account #{account_idx + 1} (network lag)")
-                    atomic_unlock_account(account_idx, slot_id)
-                    update_slot_data(slot_id, {"status": "FAILED", "error": auth_err or "Composer not ready"})
-                    browser.close()
-                    return
-
-                plus_btn = page.locator('[data-testid="composer-plus-btn"], button[aria-label*="Add files" i], button[aria-label*="attach" i], #composer-plus-btn').first
-                if plus_btn.count() == 0:
-                    auth_err = check_login_or_auth_expired(page)
-                    if auth_err:
-                        mark_account_expired(account_idx)
-                    atomic_unlock_account(account_idx, slot_id)
-                    update_slot_data(slot_id, {"status": "FAILED", "error": auth_err or "Plus button not found"})
-                    browser.close()
-                    return
-
-                plus_btn.click(timeout=5000)
-                page.wait_for_timeout(1000)
-
-                img_elem = page.locator('text="Create image"').first
-                if img_elem.count() == 0:
-                    page.wait_for_timeout(1500)
-                    img_elem = page.locator('text="Create image"').first
-
-                if img_elem.count() == 0:
-                    auth_err = check_login_or_auth_expired(page)
-                    if auth_err:
-                        print(f"❌ Account #{account_idx + 1} session expired: {auth_err}")
-                        mark_account_expired(account_idx)
-                    else:
-                        print(f"⚠️ 'Create image' option not found in menu for Account #{account_idx + 1}. Safely unlocking.")
-                    atomic_unlock_account(account_idx, slot_id)
-                    update_slot_data(slot_id, {"status": "FAILED", "error": auth_err or "Create image option not found"})
-                    browser.close()
-                    return
-
-                parent_text = img_elem.locator('..').inner_text()
-
-                try:
-                    page.keyboard.press("Escape")
-                except Exception:
-                    pass
-
-                print(f"📋 Account #{account_idx + 1} Plus Menu Text: {repr(parent_text)}")
-
-                # Dynamic, resilient quota parse (guards against false alarm when 1, 2, or 3 images remain!)
-                p_lower = parent_text.lower()
-                time_match = re.search(r"until\s+([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM|am|pm)?)", parent_text, re.IGNORECASE)
-                reset_time_str = time_match.group(1).strip() if time_match else ""
-
-                # Lookbehind (?<!\d) ensures we never falsely match '0' inside '10 images left'
-                zero_or_negative = bool(re.search(r"(?<!\d)(-\d+|0)\s*(?:images?)?\s*left", p_lower)) or \
-                                   any(k in p_lower for k in ["0 left", "no images left", "zero images left", "limit reached", "try again"])
-
-                pos_match = re.search(r"(?<!\d)([1-9]\d*)\s*(?:images?)?\s*left", p_lower)
-                remaining_detected = int(pos_match.group(1)) if pos_match else None
-
-                if reset_time_str or zero_or_negative:
-                    print(f"🔒 Account #{account_idx + 1} confirmed blocked by OpenAI until: {reset_time_str or 'Unknown'}")
-                    mark_account_rate_limited(account_idx, reset_time_str)
-                    atomic_unlock_account(account_idx, slot_id)
-                    update_slot_data(slot_id, {"status": "COMPLETED", "result": "BLOCKED", "resetTime": reset_time_str})
-                    sync_fresh_cookies(context, account_idx)
-                    send_whatsapp_alert(
-                        f"🔒 *JB STUDIO - QUOTA PROBE RESULT*\n"
-                        f"══════════════════════════════\n"
-                        f"👤 *Account:* #{account_idx + 1}\n"
-                        f"🚫 *Status:* Confirmed Rate-Limited by OpenAI\n"
-                        f"⏰ *Reset Time:* {reset_time_str or 'Next reset cycle'}\n"
-                        f"══════════════════════════════\n"
-                        f"Quota confirmed at 0. Studio apps will automatically use next available account."
-                    )
-                elif remaining_detected is not None and remaining_detected > 0:
-                    print(f"🎉 Account #{account_idx + 1} has confirmed quota remaining: {remaining_detected} images")
-                    cur_stat = {}
-                    max_images = 3
-                    try:
-                        req_all = urllib.request.Request(f"{FIREBASE_STATUS_BASE}.json", headers={"User-Agent": "StudioCloudWorker"})
-                        with urllib.request.urlopen(req_all, timeout=5) as r_all:
-                            all_stat = json.loads(r_all.read().decode("utf-8")) or {}
-                            max_images = int(all_stat.get("maxImagesPerAccount", all_stat.get("max_images_per_account", 3)))
-                            cur_stat = all_stat.get(f"acc_{account_idx}", {})
-                    except Exception:
-                        pass
-                    new_usage = max(0, max_images - remaining_detected)
-                    bonus_patch = {
-                        "usage": new_usage,
-                        "bookedBy": "",
-                        "bookedUntil": 0,
-                        "isExpired": False,
-                        "resetTime": ""
-                    }
-                    req_b = urllib.request.Request(
-                        f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json",
-                        data=json.dumps(bonus_patch).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
-                        method="PATCH"
-                    )
-                    with urllib.request.urlopen(req_b, timeout=5): pass
-                    atomic_unlock_account(account_idx, slot_id)
-                    print(f"✅ Restored Account #{account_idx + 1} to usage={new_usage} (+{remaining_detected} images available)")
-                    update_slot_data(slot_id, {"status": "COMPLETED", "result": "BONUS_AWARDED", "newUsage": new_usage})
-                    sync_fresh_cookies(context, account_idx)
-                    send_whatsapp_alert(
-                        f"🎉 *JB STUDIO - BONUS QUOTA RESTORED!* ⚡\n"
-                        f"══════════════════════════════\n"
-                        f"👤 *Account:* #{account_idx + 1}\n"
-                        f"🟢 *Status:* Unblocked! Remaining: {remaining_detected}/{max_images}\n"
-                        f"🎁 *Usage:* set to {new_usage}/{max_images}\n"
-                        f"══════════════════════════════\n"
-                        f"Account is immediately active and ready for customer photos!"
-                    )
-                else:
-                    # Ambiguous or clean menu with no explicit counts - DO NOT guess, DO NOT inflate bonus blindly!
-                    print(f"⚠️ Account #{account_idx + 1} Plus menu text is ambiguous: {repr(parent_text)}. Preserving stored quota unchanged.")
-                    atomic_unlock_account(account_idx, slot_id)
-                    update_slot_data(slot_id, {"status": "COMPLETED", "result": "AMBIGUOUS_PRESERVED"})
-                    sync_fresh_cookies(context, account_idx)
-                    send_whatsapp_alert(
-                        f"⚠️ *JB STUDIO - PROBE AMBIGUOUS*\n"
-                        f"══════════════════════════════\n"
-                        f"👤 *Account:* #{account_idx + 1}\n"
-                        f"❓ *Menu Text:* '{parent_text[:60]}'\n"
-                        f"══════════════════════════════\n"
-                        f"Stored quota preserved without change."
-                    )
-            except Exception as e:
-                auth_err = check_login_or_auth_expired(page)
-                if auth_err:
-                    print(f"❌ Account #{account_idx + 1} session expired during probe: {auth_err}")
-                    mark_account_expired(account_idx)
-                    send_whatsapp_alert(
-                        f"⚠️ *JB STUDIO - PROBE ALERT* 🚨\n"
-                        f"══════════════════════════════\n"
-                        f"👤 *Account:* #{account_idx + 1}\n"
-                        f"❌ *Status:* Session Expired ({auth_err})\n"
-                        f"══════════════════════════════\n"
-                        f"Marked as expired in pool."
-                    )
-                else:
-                    print(f"⚠️ Quota probe error: {_safe_err(e)}")
-                atomic_unlock_account(account_idx, slot_id)
-                update_slot_data(slot_id, {"status": "FAILED", "error": auth_err or str(e)})
+            check_quota_and_restore_bonus(page, context, account_idx, slot_id)
             browser.close()
             return
 
