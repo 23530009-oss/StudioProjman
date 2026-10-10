@@ -1060,88 +1060,6 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             )
             urllib.request.urlopen(req_patch, timeout=5)
             print(f"📊 Incremented Account #{int(account_idx)+1} usage to {new_usage} for {today_nepal}")
-
-            # 🔍 Automatic Inline Post-Photo Quota Introspection Probe
-            max_images = 3
-            try:
-                req_all = urllib.request.Request(f"{FIREBASE_STATUS_BASE}.json", headers={"User-Agent": "StudioCloudWorker"})
-                with urllib.request.urlopen(req_all, timeout=4) as r_all:
-                    all_stat = json.loads(r_all.read().decode("utf-8")) or {}
-                    max_images = int(all_stat.get("maxImagesPerAccount", all_stat.get("max_images_per_account", 3)))
-            except Exception:
-                pass
-
-            if new_usage >= max_images:
-                print(f"🔍 Account #{int(account_idx)+1} reached capacity ({new_usage}/{max_images}). Running live inline quota probe...")
-                try:
-                    attach_sel = '[data-testid="composer-plus-btn"], button[aria-label*="Add files" i], button[aria-label*="attach" i], #composer-plus-btn'
-                    plus_btn = page.locator(attach_sel).first
-                    if plus_btn.count() > 0 and plus_btn.is_visible():
-                        plus_btn.click(timeout=3000)
-                        page.wait_for_timeout(800)
-                        img_elem = page.locator('text="Create image"').first
-                        if img_elem.count() > 0:
-                            parent_text = img_elem.locator('..').inner_text()
-                            try:
-                                page.keyboard.press("Escape")
-                            except Exception:
-                                pass
-
-                            p_lower = parent_text.lower()
-                            explicit_zero = any(k in p_lower for k in ["0 images left", "0 left", "no images left", "zero images left"])
-                            left_match = re.search(r"(\d+)\s*(?:images?)?\s*left", p_lower)
-                            time_match = re.search(r"until\s+([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM|am|pm)?)", parent_text, re.IGNORECASE)
-                            reset_time_str = time_match.group(1).strip() if time_match else ""
-
-                            if explicit_zero:
-                                is_blocked = True
-                                remaining_detected = 0
-                            elif left_match:
-                                remaining_detected = int(left_match.group(1))
-                                is_blocked = (remaining_detected == 0)
-                            elif reset_time_str and any(k in p_lower for k in ["limit", "quota", "reached", "exceeded"]):
-                                is_blocked = True
-                                remaining_detected = 0
-                            else:
-                                is_blocked = False
-                                remaining_detected = None
-
-                            if is_blocked:
-                                print(f"🔒 Account #{int(account_idx)+1} confirmed rate-limited until: {reset_time_str or 'Next cycle'}")
-                                if reset_time_str:
-                                    mark_account_rate_limited(account_idx, reset_time_str)
-                            else:
-                                # Unblocked / Bonus capacity granted by OpenAI!
-                                print(f"🎉 Account #{int(account_idx)+1} is unblocked! Restoring bonus quota...")
-                                if remaining_detected is not None and remaining_detected > 0:
-                                    restored_usage = max(0, max_images - remaining_detected)
-                                else:
-                                    restored_usage = max(0, new_usage - 1)
-
-                                bonus_patch = {
-                                    "usage": restored_usage,
-                                    "resetTime": "",
-                                    "isExpired": False
-                                }
-                                req_b = urllib.request.Request(
-                                    f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json",
-                                    data=json.dumps(bonus_patch).encode("utf-8"),
-                                    headers={"Content-Type": "application/json"},
-                                    method="PATCH"
-                                )
-                                urllib.request.urlopen(req_b, timeout=4)
-                                print(f"✅ Restored Account #{int(account_idx)+1} to usage={restored_usage} (+1 bonus image available)")
-                                send_whatsapp_alert(
-                                    f"🎉 *JB STUDIO - BONUS QUOTA RESTORED!* ⚡\n"
-                                    f"══════════════════════════════\n"
-                                    f"👤 *Account:* #{int(account_idx)+1}\n"
-                                    f"🟢 *Status:* Unblocked! OpenAI granted bonus capacity\n"
-                                    f"🎁 *Bonus:* +1 Photo restored (Usage: {restored_usage}/{max_images})\n"
-                                    f"══════════════════════════════\n"
-                                    f"Account is immediately active and ready for customer photos!"
-                                )
-                except Exception as e_inline:
-                    print(f"⚠️ Inline quota probe note: {_safe_err(e_inline)}")
         except Exception as e_usage:
             print(f"⚠️ Failed to increment account usage: {_safe_err(e_usage)}")
         print(f"🎉 Slot {_mask_task(slot_id)} completed successfully in {time.time() - t_start:.2f}s!")
@@ -1256,9 +1174,7 @@ def process_studio_task(slot_id):
     device_id = str(slot_data.get("deviceId") or input_data.get("deviceId") or "").strip()
 
     raw_cookie = ""
-    task_type = slot_data.get("taskType") or input_data.get("taskType", "PHOTO_JOB")
-    is_quota_probe = (task_type == "VERIFY_QUOTA") or str(slot_id).startswith("probe_acc_")
-
+    # Autonomous Server Dispatch: If client omitted accountIndex (stealth blind client), server dynamically allocates best account!
     if account_idx is None or str(account_idx).strip() == "" or str(account_idx).lower() in ("auto", "none", "null"):
         print(f"🧠 Autonomous Server Dispatch: Dynamically picking best account from pool for {_mask_task(slot_id)}...")
         account_idx, raw_cookie = find_and_lock_next_account(slot_id, device_id=device_id)
@@ -1274,6 +1190,7 @@ def process_studio_task(slot_id):
         try:
             account_idx = int(account_idx)
             # 🛡️ Dynamic Race-Condition Guard for Multi-Device Concurrency:
+            # Check if this account is currently held and busy by another running slot
             is_conflict = False
             try:
                 now_ms = int(time.time() * 1000)
@@ -1283,19 +1200,14 @@ def process_studio_task(slot_id):
                     chk_until = int(chk_stat.get("bookedUntil", 0))
                     chk_by = str(chk_stat.get("bookedBy", ""))
                     chk_busy = bool(chk_stat.get("isBusy", False))
-                    # Check if this lock was placed by or for this specific task
-                    is_my_lock = (
-                        chk_by.startswith(f"cloud_runner_{slot_id}") or
-                        (is_quota_probe and (chk_by == f"probe_acc_{account_idx}" or chk_by.startswith(f"probe_acc_{account_idx}_") or chk_by.startswith("probe_acc_")))
-                    )
-                    if chk_until > now_ms and (chk_busy or chk_by) and not is_my_lock:
-                        if not is_quota_probe:
+                    if chk_until > now_ms and (chk_busy or chk_by):
+                        if not chk_by.startswith(f"cloud_runner_{slot_id}"):
                             is_conflict = True
                             print(f"⚠️ Account #{account_idx + 1} is busy with another runner. Resolving collision dynamically...")
             except Exception:
                 pass
 
-            if is_conflict and not is_quota_probe:
+            if is_conflict:
                 account_idx, raw_cookie = find_and_lock_next_account(slot_id, exclude_indices={account_idx}, device_id=device_id)
                 if account_idx is None or not raw_cookie:
                     err = "ALL_NODES_BUSY: Supercomputer cluster is currently at capacity. Please retry in 1 minute."
@@ -1313,6 +1225,9 @@ def process_studio_task(slot_id):
             update_firebase_result(slot_id, "FAILED", error=err)
             update_slot_data(slot_id, {"status": "FAILED"})
             return
+
+    task_type = slot_data.get("taskType") or input_data.get("taskType", "PHOTO_JOB")
+    is_quota_probe = (task_type == "VERIFY_QUOTA") or slot_id.startswith("probe_acc_")
 
     if not device_id:
         # Resilient fallback for installed APK versions:
@@ -1577,42 +1492,37 @@ def process_studio_task(slot_id):
                     except Exception:
                         pass
                     cur_usage = int(cur_stat.get("usage", max_images))
-                    if cur_usage >= max_images:
-                        if remaining_detected is not None and remaining_detected > 0:
-                            new_usage = max(0, max_images - remaining_detected)
-                            print(f"📊 Dynamically calibrated usage from menu text: {remaining_detected}/{max_images} remaining -> usage set to {new_usage}")
-                        else:
-                            new_usage = max(0, cur_usage - 1)
-                        bonus_patch = {
-                            "usage": new_usage,
-                            "bookedBy": "",
-                            "bookedUntil": 0,
-                            "isExpired": False,
-                            "resetTime": ""
-                        }
-                        req_b = urllib.request.Request(
-                            f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json",
-                            data=json.dumps(bonus_patch).encode("utf-8"),
-                            headers={"Content-Type": "application/json"},
-                            method="PATCH"
-                        )
-                        urllib.request.urlopen(req_b, timeout=5)
-                        print(f"✅ Restored Account #{account_idx + 1} from cooldown: usage={new_usage}/{max_images}")
-                        update_slot_data(slot_id, {"status": "COMPLETED", "result": "BONUS_AWARDED", "newUsage": new_usage})
-                        sync_fresh_cookies(context, account_idx)
-                        send_whatsapp_alert(
-                            f"🎉 *JB STUDIO - BONUS QUOTA RESTORED!* ⚡\n"
-                            f"══════════════════════════════\n"
-                            f"👤 *Account:* #{account_idx + 1}\n"
-                            f"🟢 *Status:* Unblocked! OpenAI granted bonus capacity\n"
-                            f"🎁 *Bonus:* +1 Photo restored (Usage: {new_usage}/{max_images})\n"
-                            f"══════════════════════════════\n"
-                            f"Account is immediately active and ready for customer photos!"
-                        )
+                    if remaining_detected is not None and remaining_detected > 0:
+                        new_usage = max(0, max_images - remaining_detected)
+                        print(f"📊 Dynamically calibrated usage from menu text: {remaining_detected}/{max_images} remaining -> usage set to {new_usage}")
                     else:
-                        print(f"ℹ️ Account #{account_idx + 1} already has available quota ({cur_usage}/{max_images}). No alert needed.")
-                        update_slot_data(slot_id, {"status": "COMPLETED", "result": "ALREADY_ACTIVE", "usage": cur_usage})
-                        sync_fresh_cookies(context, account_idx)
+                        new_usage = max(0, cur_usage - 1)
+                    bonus_patch = {
+                        "usage": new_usage,
+                        "bookedBy": "",
+                        "bookedUntil": 0,
+                        "isExpired": False,
+                        "resetTime": ""
+                    }
+                    req_b = urllib.request.Request(
+                        f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json",
+                        data=json.dumps(bonus_patch).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="PATCH"
+                    )
+                    urllib.request.urlopen(req_b, timeout=5)
+                    print(f"✅ Restored Account #{account_idx + 1} to usage={new_usage} (+1 bonus image available)")
+                    update_slot_data(slot_id, {"status": "COMPLETED", "result": "BONUS_AWARDED", "newUsage": new_usage})
+                    sync_fresh_cookies(context, account_idx)
+                    send_whatsapp_alert(
+                        f"🎉 *JB STUDIO - BONUS QUOTA RESTORED!* ⚡\n"
+                        f"══════════════════════════════\n"
+                        f"👤 *Account:* #{account_idx + 1}\n"
+                        f"🟢 *Status:* Unblocked! OpenAI granted bonus capacity\n"
+                        f"🎁 *Bonus:* +1 Photo restored (Usage: {new_usage}/{max_images})\n"
+                        f"══════════════════════════════\n"
+                        f"Account is immediately active and ready for customer photos!"
+                    )
             except Exception as e:
                 auth_err = check_login_or_auth_expired(page)
                 if auth_err:
