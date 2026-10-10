@@ -834,6 +834,23 @@ def check_quota_and_restore_bonus(page, context, account_idx, slot_id=None):
             return False
 
         parent_text = img_elem.locator('..').inner_text()
+
+        # 📸 Live Visual Verification: Capture screenshot of the open Plus menu
+        try:
+            ss_bytes = page.screenshot()
+            ss_b64 = base64.b64encode(ss_bytes).decode('ascii')
+            urllib.request.urlopen(urllib.request.Request(
+                f"{FIREBASE_STATUS_BASE}/lastProbeScreenshot.json",
+                data=json.dumps({"accountIndex": account_idx, "screenshot": ss_b64, "timestamp": int(time.time()*1000), "menuText": parent_text}).encode('utf-8'),
+                headers={"Content-Type": "application/json"},
+                method="PUT"
+            ), timeout=10)
+            if slot_id:
+                update_slot_data(slot_id, {"probeScreenshot": ss_b64})
+            print(f"📸 Captured and saved live probe screenshot for Account #{account_idx + 1}")
+        except Exception as e_ss:
+            print(f"⚠️ Screenshot capture note: {_safe_err(e_ss)}")
+
         try:
             page.keyboard.press("Escape")
         except Exception:
@@ -1368,11 +1385,24 @@ def process_studio_task(slot_id):
             pass
 
     if not slot_data:
-        err = f"FAILED: Could not fetch task payload for {slot_id} from Firebase after 4 retries"
-        print(f"❌ {err}. Aborting immediately to prevent unassigned execution.")
-        update_firebase_result(slot_id, "FAILED", error=err)
-        update_slot_data(slot_id, {"status": "FAILED"})
-        return
+        if slot_id.startswith("probe_acc_"):
+            try:
+                acc_part = slot_id.split("probe_acc_")[1].split("_")[0]
+                inferred_acc = int(acc_part)
+            except Exception:
+                inferred_acc = 0
+            slot_data = {
+                "status": "PENDING",
+                "taskType": "VERIFY_QUOTA",
+                "accountIndex": inferred_acc
+            }
+            print(f"ℹ️ Auto-synthesized probe payload for {slot_id}: Account #{inferred_acc + 1}")
+        else:
+            err = f"FAILED: Could not fetch task payload for {slot_id} from Firebase after 4 retries"
+            print(f"❌ {err}. Aborting immediately to prevent unassigned execution.")
+            update_firebase_result(slot_id, "FAILED", error=err)
+            update_slot_data(slot_id, {"status": "FAILED"})
+            return
 
     input_data = slot_data.get("input", {})
     initial_status = slot_data.get("status") or input_data.get("status", "PENDING")
