@@ -106,11 +106,44 @@ def decrypt_data_aes(enc_b64):
     return decrypted.decode("utf-8")
 
 
+class TaskExecutionContext:
+    def __init__(self, initial_idx, slot_id):
+        self.active_idx = initial_idx
+        self.slot_id = slot_id
+        self.held_locks = {initial_idx} if initial_idx is not None else set()
+        self.is_completed = False
+        self.swapped_from = None
+        self.switch_reason = None
+
+    def record_locked(self, idx):
+        if idx is not None:
+            self.held_locks.add(idx)
+
+    def record_unlocked(self, idx):
+        if idx is not None:
+            self.held_locks.discard(idx)
+
+    def release_all_locks(self):
+        for idx in list(self.held_locks):
+            try:
+                atomic_unlock_account(idx, self.slot_id)
+            except Exception:
+                pass
+            self.held_locks.discard(idx)
+
+
+
 _POOL_TIMESTAMP_MS = 0
+_CACHED_ACCOUNTS = None
+_CACHE_TIME = 0
 
 
-def get_decrypted_pool():
-    global _POOL_TIMESTAMP_MS
+def get_decrypted_pool(force_refresh=False):
+    global _POOL_TIMESTAMP_MS, _CACHED_ACCOUNTS, _CACHE_TIME
+    now = time.time()
+    if not force_refresh and _CACHED_ACCOUNTS is not None and (now - _CACHE_TIME < 300):
+        return _CACHED_ACCOUNTS
+
     req = urllib.request.Request(FIREBASE_COOKIE_URL, headers={"User-Agent": "StudioCloudWorker"})
     with urllib.request.urlopen(req, timeout=10) as r:
         data = json.loads(r.read().decode("utf-8"))
@@ -123,6 +156,8 @@ def get_decrypted_pool():
     accounts = parsed.get("accounts", [])
     if not accounts:
         raise RuntimeError("No accounts found in decrypted pool!")
+    _CACHED_ACCOUNTS = accounts
+    _CACHE_TIME = now
     return accounts
 
 
@@ -608,6 +643,20 @@ def atomic_unlock_account(account_idx, slot_id):
     if account_idx is None:
         return
     try:
+        # Check active lease to avoid unlocking an account booked by another task
+        try:
+            req_chk = urllib.request.Request(f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json", headers={"User-Agent": "StudioCloudWorker"})
+            with urllib.request.urlopen(req_chk, timeout=4) as r_chk:
+                stat_obj = json.loads(r_chk.read().decode("utf-8")) or {}
+                booked_by = str(stat_obj.get("bookedBy", ""))
+                booked_until = int(stat_obj.get("bookedUntil", 0))
+                now_ms = int(time.time() * 1000)
+                if booked_by and (slot_id not in booked_by) and (booked_until > now_ms):
+                    print(f"ℹ️ Account #{int(account_idx)+1} is active for '{_mask_task(booked_by)}'; skipping unlock.")
+                    return
+        except Exception:
+            pass
+
         acc_url = f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json"
         payload = {
             "bookedBy": "",
@@ -620,7 +669,8 @@ def atomic_unlock_account(account_idx, slot_id):
             headers={"Content-Type": "application/json"},
             method="PATCH"
         )
-        urllib.request.urlopen(req, timeout=5)
+        with urllib.request.urlopen(req, timeout=5):
+            pass
         print(f"🔓 Released lock on Account #{int(account_idx)+1} for slot {_mask_task(slot_id)} (isBusy=False)")
     except Exception as e:
         print(f"⚠️ Failed to unlock Account #{int(account_idx)+1}: {_safe_err(e)}")
@@ -747,6 +797,9 @@ def check_login_or_auth_expired(page):
 
 
 def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_start, device_id="", switched_from=None, switch_reason=None):
+    task_ctx = account_idx if isinstance(account_idx, TaskExecutionContext) else TaskExecutionContext(account_idx, slot_id)
+    current_acc_idx = task_ctx.active_idx
+
     temp_img_path = None
     if img_b64:
         try:
@@ -773,27 +826,28 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
     if not composer_ready:
         auth_err = check_login_or_auth_expired(page)
+        old_idx = current_acc_idx
         if auth_err:
-            err = f"EXPLICIT_AUTH_EXPIRED: Account #{int(account_idx)+1}: {auth_err}"
+            err = f"EXPLICIT_AUTH_EXPIRED: Account #{int(old_idx)+1}: {auth_err}"
             print(f"❌ {err}")
-            mark_account_expired(account_idx)
-            atomic_unlock_account(account_idx, slot_id)
+            mark_account_expired(old_idx)
         else:
-            print(f"⚠️ Composer not ready within 30s on Account #{int(account_idx)+1} (network or render lag).")
-            print(f"🔓 Safely releasing lock on Account #{int(account_idx)+1} so it remains healthy for next time...")
-            atomic_unlock_account(account_idx, slot_id)
+            print(f"⚠️ Composer not ready within 30s on Account #{int(old_idx)+1} (network or render lag).")
+            print(f"🔓 Safely releasing lock on Account #{int(old_idx)+1} so it remains healthy for next time...")
+        
+        atomic_unlock_account(old_idx, slot_id)
+        task_ctx.record_unlocked(old_idx)
 
         # In-Flight Round-Robin Hot-Swap to next available account
         print(f"⚡ In-Flight Hot-Swap: Querying next eligible account from pool...")
-        old_idx = account_idx
-        new_idx, new_cookie = find_and_lock_next_account(slot_id, exclude_indices=[account_idx])
+        new_idx, new_cookie = find_and_lock_next_account(slot_id, exclude_indices=[old_idx])
         if new_idx is not None and new_cookie:
             print(f"🚀 In-Flight Hot-Swap Success: Switched to Account #{new_idx+1}!")
+            task_ctx.record_locked(new_idx)
             switched_from = old_idx
             switch_reason = "Redirected" if auth_err else "Composer Timeout"
-            account_idx = new_idx
             update_slot_data(slot_id, {
-                "accountIndex": account_idx,
+                "accountIndex": new_idx,
                 "switchedFrom": switched_from,
                 "switchReason": switch_reason
             })
@@ -812,28 +866,32 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
                     "textarea:not(.wcDTda_fallbackTextarea):visible"
                 ).first
                 composer.wait_for(state="visible", timeout=30000)
+                task_ctx.active_idx = new_idx
+                current_acc_idx = new_idx
                 composer_ready = True
-                print(f"✅ Hot-swap Account #{account_idx+1} composer ready!")
+                print(f"✅ Hot-swap Account #{new_idx+1} composer ready!")
             except Exception as e_swap:
-                print(f"❌ Hot-swap failed on Account #{account_idx+1}: {e_swap}")
-                update_firebase_result(slot_id, "FAILED", error=f"TRANSIENT_TIMEOUT: Hot-swap Account #{account_idx+1} failed ({e_swap})")
+                print(f"❌ Hot-swap failed on Account #{new_idx+1}: {e_swap}")
+                atomic_unlock_account(new_idx, slot_id)
+                task_ctx.record_unlocked(new_idx)
+                update_firebase_result(slot_id, "FAILED", error=f"TRANSIENT_TIMEOUT: Hot-swap Account #{new_idx+1} failed ({e_swap})", account_idx=new_idx)
                 update_slot_data(slot_id, {"status": "FAILED"})
                 return False
         else:
-            err = f"TRANSIENT_TIMEOUT: Composer not ready within 30s on Account #{int(account_idx)+1} (no fallback available)"
+            err = f"TRANSIENT_TIMEOUT: Composer not ready within 30s on Account #{int(old_idx)+1} (no fallback available)"
             print(f"❌ {err}")
-            update_firebase_result(slot_id, "FAILED", error=err)
+            update_firebase_result(slot_id, "FAILED", error=err, account_idx=old_idx)
             update_slot_data(slot_id, {"status": "FAILED"})
             return False
 
     # Capture rotated cookies as soon as composer is authenticated & ready
-    sync_fresh_cookies(page.context, account_idx)
+    sync_fresh_cookies(page.context, current_acc_idx)
 
     photo_uploaded = False
     if not temp_img_path or not os.path.exists(temp_img_path):
         err = "FAILED: Cannot generate photo without input image file (aborted to prevent text hallucination)"
         print(f"❌ {err}")
-        update_firebase_result(slot_id, "FAILED", error=err, account_idx=account_idx)
+        update_firebase_result(slot_id, "FAILED", error=err, account_idx=current_acc_idx)
         update_slot_data(slot_id, {"status": "FAILED"})
         return False
 
@@ -897,6 +955,9 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
     # Wait for result
     print("⏳ Waiting for ChatGPT to generate result (up to 90s)...")
+    assistant_text = ""
+    is_rate_limit = False
+    is_auth_expired = False
     generated_img_bytes = None
     gen_start = time.time()
 
@@ -980,11 +1041,8 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         if stop_btn.count() == 0 and (time.time() - gen_start) > 8 and images and generated_img_bytes:
             break
 
-    # Assistant message / rate limit checks
-    assistant_text = ""
-    is_rate_limit = False
-    is_auth_expired = False
-    if not generated_img_bytes:
+    # Assistant message / rate limit checks (Preserve early detected flags)
+    if not generated_img_bytes and not is_rate_limit and not is_auth_expired:
         try:
             msgs = page.locator('div[data-message-author-role="assistant"]').all_inner_texts()
             assistant_text = " ".join(msgs).strip()
@@ -1020,16 +1078,17 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         update_firebase_result(
             slot_id, "COMPLETED",
             image_b64=out_b64,
-            account_idx=account_idx,
+            account_idx=current_acc_idx,
             switched_from=switched_from,
             switch_reason=switch_reason
         )
-        slot_patch = {"status": "COMPLETED", "accountIndex": account_idx}
+        task_ctx.is_completed = True
+        slot_patch = {"status": "COMPLETED", "accountIndex": current_acc_idx}
         if switched_from is not None:
             slot_patch["switchedFrom"] = switched_from
             slot_patch["switchReason"] = switch_reason or "Redirected"
         update_slot_data(slot_id, slot_patch)
-        sync_fresh_cookies(page.context, account_idx)
+        sync_fresh_cookies(page.context, current_acc_idx)
         # 💳 SERVER-LEVEL CREDIT DEDUCTION: Authoritative server-side wallet balance decrement
         if device_id:
             deduct_server_device_credit(device_id)
@@ -1037,7 +1096,7 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         # 📊 Increment Account Pool Usage & Update Quota Day
         try:
             today_nepal = get_nepal_date_string()
-            req_get = urllib.request.Request(f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json", headers={"User-Agent": "StudioCloudWorker"})
+            req_get = urllib.request.Request(f"{FIREBASE_STATUS_BASE}/acc_{current_acc_idx}.json", headers={"User-Agent": "StudioCloudWorker"})
             with urllib.request.urlopen(req_get, timeout=5) as r_stat:
                 acc_stat = json.loads(r_stat.read().decode("utf-8")) or {}
             
@@ -1053,13 +1112,14 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
                 "lastUsed": now_ms
             }
             req_patch = urllib.request.Request(
-                f"{FIREBASE_STATUS_BASE}/acc_{account_idx}.json",
+                f"{FIREBASE_STATUS_BASE}/acc_{current_acc_idx}.json",
                 data=json.dumps(acc_patch).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="PATCH"
             )
-            urllib.request.urlopen(req_patch, timeout=5)
-            print(f"📊 Incremented Account #{int(account_idx)+1} usage to {new_usage} for {today_nepal}")
+            with urllib.request.urlopen(req_patch, timeout=5):
+                pass
+            print(f"📊 Incremented Account #{int(current_acc_idx)+1} usage to {new_usage} for {today_nepal}")
         except Exception as e_usage:
             print(f"⚠️ Failed to increment account usage: {_safe_err(e_usage)}")
         print(f"🎉 Slot {_mask_task(slot_id)} completed successfully in {time.time() - t_start:.2f}s!")
@@ -1067,27 +1127,29 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     else:
         # 🚀 IN-FLIGHT LIVE HOT-SWAP: If rate-limited or auth-expired, swap to next account and retry in same session!
         if (is_rate_limit or is_auth_expired) and switched_from is None:
+            old_idx = current_acc_idx
             if is_rate_limit:
                 time_match = re.search(r"(?:after|until|at|around)\s+([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM|am|pm)?)", assistant_text, re.IGNORECASE)
                 reset_time_str = time_match.group(1).strip() if time_match else None
-                mark_account_rate_limited(account_idx, reset_time_str)
-                err = f"EXPLICIT_RATE_LIMIT: Account #{int(account_idx)+1}: {assistant_text[:120]}"
+                mark_account_rate_limited(old_idx, reset_time_str)
+                err = f"EXPLICIT_RATE_LIMIT: Account #{int(old_idx)+1}: {assistant_text[:120]}"
             else:
-                mark_account_expired(account_idx)
-                err = f"EXPLICIT_AUTH_EXPIRED: Account #{int(account_idx)+1} requires login: {assistant_text[:120]}"
+                mark_account_expired(old_idx)
+                err = f"EXPLICIT_AUTH_EXPIRED: Account #{int(old_idx)+1} requires login: {assistant_text[:120]}"
 
             print(f"⚠️ {err}")
-            atomic_unlock_account(account_idx, slot_id)
+            atomic_unlock_account(old_idx, slot_id)
+            task_ctx.record_unlocked(old_idx)
+
             print(f"⚡ In-Flight Hot-Swap: Querying next eligible account from pool for {_mask_task(slot_id)}...")
-            old_idx = account_idx
-            new_idx, new_cookie = find_and_lock_next_account(slot_id, exclude_indices=[account_idx], device_id=device_id)
+            new_idx, new_cookie = find_and_lock_next_account(slot_id, exclude_indices=[old_idx], device_id=device_id)
             if new_idx is not None and new_cookie:
                 print(f"🚀 In-Flight Hot-Swap Success: Instantly switched to Account #{new_idx+1}!")
+                task_ctx.record_locked(new_idx)
                 switched_from = old_idx
                 switch_reason = "Rate Limit Redirect" if is_rate_limit else "Auth Expired Redirect"
-                account_idx = new_idx
                 update_slot_data(slot_id, {
-                    "accountIndex": account_idx,
+                    "accountIndex": new_idx,
                     "switchedFrom": switched_from,
                     "switchReason": switch_reason
                 })
@@ -1102,28 +1164,31 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
                             btn.click(timeout=1000)
 
                     # Seamless in-flight retry on fresh account!
+                    task_ctx.active_idx = new_idx
                     return execute_chatgpt_generation(
-                        page, slot_id, account_idx, prompt, img_b64, t_start,
+                        page, slot_id, task_ctx, prompt, img_b64, t_start,
                         device_id=device_id,
                         switched_from=switched_from,
                         switch_reason=switch_reason
                     )
                 except Exception as ex_swap:
-                    print(f"⚠️ In-flight swap re-execution failed: {_safe_err(ex_swap)}")
+                    print(f"⚠️ In-flight swap re-execution failed on Account #{new_idx+1}: {_safe_err(ex_swap)}")
+                    atomic_unlock_account(new_idx, slot_id)
+                    task_ctx.record_unlocked(new_idx)
 
         if is_rate_limit:
             time_match = re.search(r"(?:after|until|at|around)\s+([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM|am|pm)?)", assistant_text, re.IGNORECASE)
             reset_time_str = time_match.group(1).strip() if time_match else None
-            mark_account_rate_limited(account_idx, reset_time_str)
-            err = f"EXPLICIT_RATE_LIMIT: Account #{int(account_idx)+1}: {assistant_text[:120]}"
+            mark_account_rate_limited(current_acc_idx, reset_time_str)
+            err = f"EXPLICIT_RATE_LIMIT: Account #{int(current_acc_idx)+1}: {assistant_text[:120]}"
         elif is_auth_expired:
-            mark_account_expired(account_idx)
-            err = f"EXPLICIT_AUTH_EXPIRED: Account #{int(account_idx)+1} requires login: {assistant_text[:120]}"
+            mark_account_expired(current_acc_idx)
+            err = f"EXPLICIT_AUTH_EXPIRED: Account #{int(current_acc_idx)+1} requires login: {assistant_text[:120]}"
         else:
             snippet = f": {assistant_text[:100]}" if assistant_text else ""
             err = f"TRANSIENT_TIMEOUT: Image element not detected in response within 90s{snippet}"
         print(f"❌ {err}")
-        update_firebase_result(slot_id, "FAILED", error=err)
+        update_firebase_result(slot_id, "FAILED", error=err, account_idx=current_acc_idx)
         update_slot_data(slot_id, {"status": "FAILED"})
         return False
 
@@ -1226,6 +1291,7 @@ def process_studio_task(slot_id):
             update_slot_data(slot_id, {"status": "FAILED"})
             return
 
+    task_ctx = TaskExecutionContext(account_idx, slot_id)
     task_type = slot_data.get("taskType") or input_data.get("taskType", "PHOTO_JOB")
     is_quota_probe = (task_type == "VERIFY_QUOTA") or slot_id.startswith("probe_acc_")
 
@@ -1248,7 +1314,7 @@ def process_studio_task(slot_id):
         if not auth_ok:
             err = f"SERVER_AUTH_REJECTED: {auth_err}"
             print(f"🛑 {err} for {_mask_task(slot_id)} (Device: '{_mask_device(device_id)}'). Aborting cloud execution immediately.")
-            atomic_unlock_account(account_idx, slot_id)
+            task_ctx.release_all_locks()
             update_firebase_result(slot_id, "FAILED", error=err)
             update_slot_data(slot_id, {"status": "FAILED", "error": err})
             return
@@ -1445,25 +1511,17 @@ def process_studio_task(slot_id):
 
                 # Dynamic, resilient quota parse (guards against false alarm when 1, 2, or 3 images remain!)
                 p_lower = parent_text.lower()
-                explicit_zero = any(k in p_lower for k in ["0 images left", "0 left", "no images left", "zero images left"])
-                left_match = re.search(r"(\d+)\s*(?:images?)?\s*left", p_lower)
                 time_match = re.search(r"until\s+([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM|am|pm)?)", parent_text, re.IGNORECASE)
                 reset_time_str = time_match.group(1).strip() if time_match else ""
 
-                if explicit_zero:
-                    is_blocked = True
-                    remaining_detected = 0
-                elif left_match:
-                    remaining_detected = int(left_match.group(1))
-                    is_blocked = (remaining_detected == 0)
-                elif reset_time_str and any(k in p_lower for k in ["limit", "quota", "reached", "exceeded"]):
-                    is_blocked = True
-                    remaining_detected = 0
-                else:
-                    is_blocked = False
-                    remaining_detected = None
+                # Lookbehind (?<!\d) ensures we never falsely match '0' inside '10 images left'
+                zero_or_negative = bool(re.search(r"(?<!\d)(-\d+|0)\s*(?:images?)?\s*left", p_lower)) or \
+                                   any(k in p_lower for k in ["0 left", "no images left", "zero images left", "limit reached", "try again"])
 
-                if is_blocked:
+                pos_match = re.search(r"(?<!\d)([1-9]\d*)\s*(?:images?)?\s*left", p_lower)
+                remaining_detected = int(pos_match.group(1)) if pos_match else None
+
+                if reset_time_str or zero_or_negative:
                     print(f"🔒 Account #{account_idx + 1} confirmed blocked by OpenAI until: {reset_time_str or 'Unknown'}")
                     mark_account_rate_limited(account_idx, reset_time_str)
                     atomic_unlock_account(account_idx, slot_id)
@@ -1478,9 +1536,8 @@ def process_studio_task(slot_id):
                         f"══════════════════════════════\n"
                         f"Quota confirmed at 0. Studio apps will automatically use next available account."
                     )
-                else:
-                    # Not blocked! Calculate accurate usage based on dynamic remaining count
-                    print(f"🎉 Account #{account_idx + 1} is NOT blocked by OpenAI! Restoring quota...")
+                elif remaining_detected is not None and remaining_detected > 0:
+                    print(f"🎉 Account #{account_idx + 1} has confirmed quota remaining: {remaining_detected} images")
                     cur_stat = {}
                     max_images = 3
                     try:
@@ -1491,12 +1548,7 @@ def process_studio_task(slot_id):
                             cur_stat = all_stat.get(f"acc_{account_idx}", {})
                     except Exception:
                         pass
-                    cur_usage = int(cur_stat.get("usage", max_images))
-                    if remaining_detected is not None and remaining_detected > 0:
-                        new_usage = max(0, max_images - remaining_detected)
-                        print(f"📊 Dynamically calibrated usage from menu text: {remaining_detected}/{max_images} remaining -> usage set to {new_usage}")
-                    else:
-                        new_usage = max(0, cur_usage - 1)
+                    new_usage = max(0, max_images - remaining_detected)
                     bonus_patch = {
                         "usage": new_usage,
                         "bookedBy": "",
@@ -1510,18 +1562,33 @@ def process_studio_task(slot_id):
                         headers={"Content-Type": "application/json"},
                         method="PATCH"
                     )
-                    urllib.request.urlopen(req_b, timeout=5)
-                    print(f"✅ Restored Account #{account_idx + 1} to usage={new_usage} (+1 bonus image available)")
+                    with urllib.request.urlopen(req_b, timeout=5): pass
+                    atomic_unlock_account(account_idx, slot_id)
+                    print(f"✅ Restored Account #{account_idx + 1} to usage={new_usage} (+{remaining_detected} images available)")
                     update_slot_data(slot_id, {"status": "COMPLETED", "result": "BONUS_AWARDED", "newUsage": new_usage})
                     sync_fresh_cookies(context, account_idx)
                     send_whatsapp_alert(
                         f"🎉 *JB STUDIO - BONUS QUOTA RESTORED!* ⚡\n"
                         f"══════════════════════════════\n"
                         f"👤 *Account:* #{account_idx + 1}\n"
-                        f"🟢 *Status:* Unblocked! OpenAI granted bonus capacity\n"
-                        f"🎁 *Bonus:* +1 Photo restored (Usage: {new_usage}/{max_images})\n"
+                        f"🟢 *Status:* Unblocked! Remaining: {remaining_detected}/{max_images}\n"
+                        f"🎁 *Usage:* set to {new_usage}/{max_images}\n"
                         f"══════════════════════════════\n"
                         f"Account is immediately active and ready for customer photos!"
+                    )
+                else:
+                    # Ambiguous or clean menu with no explicit counts - DO NOT guess, DO NOT inflate bonus blindly!
+                    print(f"⚠️ Account #{account_idx + 1} Plus menu text is ambiguous: {repr(parent_text)}. Preserving stored quota unchanged.")
+                    atomic_unlock_account(account_idx, slot_id)
+                    update_slot_data(slot_id, {"status": "COMPLETED", "result": "AMBIGUOUS_PRESERVED"})
+                    sync_fresh_cookies(context, account_idx)
+                    send_whatsapp_alert(
+                        f"⚠️ *JB STUDIO - PROBE AMBIGUOUS*\n"
+                        f"══════════════════════════════\n"
+                        f"👤 *Account:* #{account_idx + 1}\n"
+                        f"❓ *Menu Text:* '{parent_text[:60]}'\n"
+                        f"══════════════════════════════\n"
+                        f"Stored quota preserved without change."
                     )
             except Exception as e:
                 auth_err = check_login_or_auth_expired(page)
@@ -1569,22 +1636,28 @@ def process_studio_task(slot_id):
 
             standby_start = time.time()
             task_received = False
-
             while (time.time() - standby_start) < 180:
-                poll_slot = fetch_slot_data(slot_id)
-                p_status = poll_slot.get("status")
-                p_input = poll_slot.get("input", {})
+                # Lightweight status-only check to avoid multi-MB base64 downloads every 800ms
+                poll_status = None
+                try:
+                    req_st = urllib.request.Request(f"{FIREBASE_TASKS_BASE}/{slot_id}/status.json", headers={"User-Agent": "StudioCloudWorker"})
+                    with urllib.request.urlopen(req_st, timeout=4) as r_st:
+                        poll_status = json.loads(r_st.read().decode("utf-8"))
+                except Exception:
+                    pass
 
-                if p_status == "PENDING" or p_input.get("imageBase64"):
+                if poll_status == "PENDING":
+                    poll_slot = fetch_slot_data(slot_id)
+                    p_input = poll_slot.get("input", {})
                     print(f"⚡ FAST PICKUP! Operator submitted photo after {time.time() - standby_start:.1f}s of standby!")
                     prompt = p_input.get("prompt", prompt)
                     img_b64 = p_input.get("imageBase64", "")
                     update_slot_data(slot_id, {"status": "PROCESSING"})
                     task_received = True
                     break
-                elif p_status == "CANCELLED":
+                elif poll_status == "CANCELLED":
                     print(f"⏹️ Slot {_mask_task(slot_id)} was CANCELLED by operator. Exiting cleanly.")
-                    atomic_unlock_account(account_idx, slot_id)
+                    task_ctx.release_all_locks()
                     browser.close()
                     return
 
@@ -1593,7 +1666,7 @@ def process_studio_task(slot_id):
             if not task_received:
                 print(f"⏰ Slot {_mask_task(slot_id)} 180s cloud watchdog expired with no operator input.")
                 update_slot_data(slot_id, {"status": "EXPIRED"})
-                atomic_unlock_account(account_idx, slot_id)
+                task_ctx.release_all_locks()
                 browser.close()
                 return
         else:
@@ -1607,22 +1680,22 @@ def process_studio_task(slot_id):
         if not is_quota_probe and not is_prewarm and not img_b64:
             err = "FAILED: No photo attached in task payload (aborted to prevent text hallucination)"
             print(f"❌ {err}")
-            update_firebase_result(slot_id, "FAILED", error=err, account_idx=account_idx)
+            update_firebase_result(slot_id, "FAILED", error=err, account_idx=task_ctx.active_idx)
             update_slot_data(slot_id, {"status": "FAILED"})
-            atomic_unlock_account(account_idx, slot_id)
+            task_ctx.release_all_locks()
             browser.close()
             return
 
         # Execute Generation
         try:
             execute_chatgpt_generation(
-                page, slot_id, account_idx, prompt, img_b64, t_start,
+                page, slot_id, task_ctx, prompt, img_b64, t_start,
                 device_id=device_id,
                 switched_from=switched_from,
                 switch_reason=switch_reason
             )
         finally:
-            atomic_unlock_account(account_idx, slot_id)
+            task_ctx.release_all_locks()
             browser.close()
 
 
@@ -1912,19 +1985,20 @@ def run_nightly_maintenance():
             except Exception:
                 pass
 
-            raw_cookie = get_active_cookie(idx)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 850},
-                device_scale_factor=1,
-                locale="en-US",
-                timezone_id="Asia/Kathmandu"
-            )
-            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            inject_cookies_to_context(context, raw_cookie)
-            page = context.new_page()
-
+            context = None
             try:
+                raw_cookie = get_active_cookie(idx)
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    viewport={"width": 1280, "height": 850},
+                    device_scale_factor=1,
+                    locale="en-US",
+                    timezone_id="Asia/Kathmandu"
+                )
+                context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                inject_cookies_to_context(context, raw_cookie)
+                page = context.new_page()
+
                 email = accounts[idx].get("email", f"Account #{idx+1}")
                 tag = f"[{'RETRY ' if is_retry else ''}{idx+1}/{total}]"
                 print(f"\n{tag} 🔍 Checking Account #{idx+1}...")
@@ -1989,20 +2063,14 @@ def run_nightly_maintenance():
                 # Release lock only if booked by nightly_maintenance
                 if lock_acquired:
                     try:
-                        unlock_url = f"{FIREBASE_STATUS_BASE}/acc_{idx}.json"
-                        req_u = urllib.request.Request(
-                            unlock_url,
-                            data=json.dumps({"bookedBy": "", "bookedUntil": 0, "isBusy": False}).encode("utf-8"),
-                            headers={"Content-Type": "application/json"},
-                            method="PATCH"
-                        )
-                        urllib.request.urlopen(req_u, timeout=5)
+                        atomic_unlock_account(idx, "nightly_maintenance")
                     except Exception:
                         pass
-                try:
-                    context.close()
-                except Exception:
-                    pass
+                if context:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
 
         # First pass across all accounts
         skipped_for_retry = []
@@ -2068,4 +2136,17 @@ if __name__ == "__main__":
     if target_task_id == "nightly_maintenance" or os.environ.get("RUN_MODE") == "NIGHTLY_MAINTENANCE":
         run_nightly_maintenance()
     else:
-        process_studio_task(target_task_id)
+        try:
+            process_studio_task(target_task_id)
+        except Exception as fatal_e:
+            err_msg = f"FATAL_WORKER_CRASH: {_safe_err(fatal_e)}"
+            print(f"💥 Unhandled fatal error in runner for {target_task_id}: {err_msg}")
+            try:
+                curr = fetch_slot_data(target_task_id)
+                st = curr.get("status") if curr else ""
+                if st not in ("COMPLETED", "FAILED", "CANCELLED"):
+                    update_firebase_result(target_task_id, "FAILED", error=err_msg)
+                    update_slot_data(target_task_id, {"status": "FAILED", "error": err_msg})
+            except Exception:
+                pass
+            raise
