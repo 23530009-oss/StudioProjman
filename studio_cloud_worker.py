@@ -929,7 +929,7 @@ def check_quota_and_restore_bonus(page, context, account_idx, slot_id=None):
         return False
 
 
-def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_start, device_id="", switched_from=None, switch_reason=None):
+def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_start, device_id="", switched_from=None, switch_reason=None, dress_b64=None):
     task_ctx = account_idx if isinstance(account_idx, TaskExecutionContext) else TaskExecutionContext(account_idx, slot_id)
     current_acc_idx = task_ctx.active_idx
 
@@ -942,6 +942,16 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             print(f"💾 Input image saved to: {temp_img_path} ({os.path.getsize(temp_img_path)} bytes)")
         except Exception as e:
             print(f"⚠️ Error saving input image: {e}")
+
+    temp_dress_path = None
+    if dress_b64:
+        try:
+            temp_dress_path = os.path.join(tempfile.gettempdir(), f"{slot_id}_dress.jpg")
+            with open(temp_dress_path, "wb") as f:
+                f.write(base64.b64decode(dress_b64))
+            print(f"👗 Reference attire image saved to: {temp_dress_path} ({os.path.getsize(temp_dress_path)} bytes)")
+        except Exception as e:
+            print(f"⚠️ Error saving reference dress image: {e}")
 
     # Wait for composer
     composer = page.locator(
@@ -1032,7 +1042,8 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     try:
         file_input = page.locator('input[type="file"]').first
         file_input.wait_for(state="attached", timeout=15000)
-        file_input.set_input_files(temp_img_path)
+        upload_files = [temp_img_path, temp_dress_path] if temp_dress_path else temp_img_path
+        file_input.set_input_files(upload_files)
     except Exception as e:
         err = f"TRANSIENT_TIMEOUT: File input attach timed out ({e})"
         print(f"❌ {err}")
@@ -1322,7 +1333,8 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
                         page, slot_id, task_ctx, prompt, img_b64, t_start,
                         device_id=device_id,
                         switched_from=switched_from,
-                        switch_reason=switch_reason
+                        switch_reason=switch_reason,
+                        dress_b64=dress_b64
                     )
                 except Exception as ex_swap:
                     print(f"⚠️ In-flight swap re-execution failed on Account #{new_idx+1}: {_safe_err(ex_swap)}")
@@ -1487,6 +1499,7 @@ def process_studio_task(slot_id):
 
     initial_status = slot_data.get("status") or input_data.get("status", "PENDING")
     img_b64 = input_data.get("imageBase64", "")
+    dress_b64 = input_data.get("dressImageBase64") or None
     prompt = input_data.get("prompt", "Professional passport photo portrait")
 
     is_prewarm = (initial_status == "WARMING") or (not img_b64 and initial_status != "PENDING" and not is_quota_probe)
@@ -1652,6 +1665,7 @@ def process_studio_task(slot_id):
                     print(f"⚡ FAST PICKUP! Operator submitted photo after {time.time() - standby_start:.1f}s of standby!")
                     prompt = p_input.get("prompt", prompt)
                     img_b64 = p_input.get("imageBase64", "")
+                    dress_b64 = p_input.get("dressImageBase64", dress_b64)
                     update_slot_data(slot_id, {"status": "PROCESSING"})
                     task_received = True
                     break
@@ -1674,6 +1688,7 @@ def process_studio_task(slot_id):
             print(f"⚡ FAST-CLICK / DIRECT RUN: Processing task immediately (boot elapsed: {time.time() - t_start:.2f}s)!")
             prompt = current_input.get("prompt", prompt)
             img_b64 = current_input.get("imageBase64", img_b64)
+            dress_b64 = current_input.get("dressImageBase64", dress_b64)
             update_slot_data(slot_id, {"status": "PROCESSING"})
 
         # Fail-fast guard: Real photo jobs require imageBase64 input
@@ -1692,7 +1707,8 @@ def process_studio_task(slot_id):
                 page, slot_id, task_ctx, prompt, img_b64, t_start,
                 device_id=device_id,
                 switched_from=switched_from,
-                switch_reason=switch_reason
+                switch_reason=switch_reason,
+                dress_b64=dress_b64
             )
         finally:
             task_ctx.release_all_locks()
