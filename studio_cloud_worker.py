@@ -1040,9 +1040,17 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
     print("📤 Uploading portrait to ChatGPT...")
     try:
-        file_input = page.locator('input[type="file"]').first
+        # Target multi-file attachment input, excluding single-photo camera inputs (which lack 'multiple')
+        file_input = page.locator('input[type="file"]:not([capture])').first
+        if file_input.count() == 0:
+            file_input = page.locator('input[type="file"]').first
         file_input.wait_for(state="attached", timeout=15000)
         upload_files = [temp_img_path, temp_dress_path] if temp_dress_path else temp_img_path
+        if temp_dress_path:
+            try:
+                file_input.evaluate("el => el.setAttribute('multiple', '')")
+            except Exception:
+                pass
         file_input.set_input_files(upload_files)
     except Exception as e:
         err = f"TRANSIENT_TIMEOUT: File input attach timed out ({e})"
