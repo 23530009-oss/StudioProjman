@@ -1242,8 +1242,17 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         update_slot_data(slot_id, slot_patch)
         sync_fresh_cookies(page.context, current_acc_idx)
         # 💳 SERVER-LEVEL CREDIT DEDUCTION: Authoritative server-side wallet balance decrement
-        if device_id:
+        is_task_retry = False
+        try:
+            slot_curr = fetch_slot_data(slot_id) or {}
+            is_task_retry = slot_curr.get("isRetry") is True or slot_curr.get("input", {}).get("isRetry") is True
+        except Exception:
+            pass
+
+        if device_id and not is_task_retry:
             deduct_server_device_credit(device_id)
+        elif is_task_retry:
+            print(f"🔄 ZERO-CREDIT RETRY: Bypassing credit deduction for Device {_mask_device(device_id)} (Task: {_mask_task(slot_id)})")
 
         # 📊 Increment Account Pool Usage & Update Quota Day
         try:
