@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import tempfile
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
 
@@ -380,6 +381,59 @@ def update_firebase_result(task_id, status, image_b64=None, error=None, account_
             print(f"📡 Firebase task {_mask_task(task_id)} result updated: {resp.status} ({status})")
     except Exception as e:
         print(f"⚠️ Error updating Firebase result: {_safe_err(e)}")
+
+def push_studio_telemetry(task_id, status, account_idx=None, duration_sec=None, is_retry=False, is_prewarm=False, parent_task_id=None, error=None):
+    """
+    Direct Worker-to-Firebase Telemetry Pipeline.
+    Writes ~150 bytes of execution metadata directly to studio_telemetry/{task_id}.json.
+    Eliminates all reverse GitHub Actions scraping, time-window searches, and data redundancy.
+    """
+    if not task_id:
+        return
+    try:
+        run_id = os.environ.get("GITHUB_RUN_ID", "").strip()
+        repo = os.environ.get("GITHUB_REPOSITORY", "23530009-oss/StudioProjman").strip()
+        html_url = f"https://github.com/{repo}/actions/runs/{run_id}" if run_id else f"https://github.com/{repo}/actions"
+        
+        telemetry_data = {
+            "taskId": task_id,
+            "runId": run_id or None,
+            "repo": repo,
+            "htmlUrl": html_url,
+            "accountNumber": (int(account_idx) + 1) if account_idx is not None else None,
+            "status": status,
+            "durationSec": round(float(duration_sec), 2) if duration_sec is not None else None,
+            "isRetry": bool(is_retry),
+            "isPrewarm": bool(is_prewarm),
+            "parentTaskId": parent_task_id or None,
+            "error": _safe_err(error) if error else None,
+            "timestamp": int(time.time() * 1000)
+        }
+        
+        url = f"{FIREBASE_BASE}/studio_telemetry/{urllib.parse.quote(task_id)}.json"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(telemetry_data).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PUT"
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(f"📊 Studio Telemetry saved for {_mask_task(task_id)}: status={status}, account={telemetry_data['accountNumber']}, duration={telemetry_data['durationSec']}s")
+            
+        # If this attempt has a parent (failover retry or likeness retake), link it on the parent node
+        if parent_task_id:
+            parent_url = f"{FIREBASE_BASE}/studio_telemetry/{urllib.parse.quote(parent_task_id)}.json"
+            patch_data = {"nextAttemptTaskId": task_id}
+            req_p = urllib.request.Request(
+                parent_url,
+                data=json.dumps(patch_data).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="PATCH"
+            )
+            with urllib.request.urlopen(req_p, timeout=10):
+                print(f"🔗 Telemetry parent link saved: {_mask_task(parent_task_id)} -> {_mask_task(task_id)}")
+    except Exception as e:
+        print(f"⚠️ Error saving studio telemetry: {_safe_err(e)}")
 
 def verify_server_device_authorization(device_id):
     """
@@ -933,6 +987,10 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     task_ctx = account_idx if isinstance(account_idx, TaskExecutionContext) else TaskExecutionContext(account_idx, slot_id)
     current_acc_idx = task_ctx.active_idx
 
+    slot_curr = fetch_slot_data(slot_id) or {}
+    is_task_retry = slot_curr.get("isRetry") is True or slot_curr.get("input", {}).get("isRetry") is True
+    parent_task_id = slot_curr.get("parentTaskId") or slot_curr.get("input", {}).get("parentTaskId")
+
     temp_img_path = None
     if img_b64:
         try:
@@ -1036,6 +1094,15 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         print(f"❌ {err}")
         update_firebase_result(slot_id, "FAILED", error=err, account_idx=current_acc_idx)
         update_slot_data(slot_id, {"status": "FAILED"})
+        push_studio_telemetry(
+            task_id=slot_id,
+            status="FAILED",
+            account_idx=current_acc_idx,
+            duration_sec=time.time() - t_start,
+            is_retry=is_task_retry,
+            parent_task_id=parent_task_id,
+            error=err
+        )
         return False
 
     print("📤 Uploading portrait to ChatGPT...")
@@ -1284,6 +1351,14 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         except Exception as e_usage:
             print(f"⚠️ Failed to increment account usage: {_safe_err(e_usage)}")
         print(f"🎉 Slot {_mask_task(slot_id)} completed successfully in {time.time() - t_start:.2f}s!")
+        push_studio_telemetry(
+            task_id=slot_id,
+            status="COMPLETED",
+            account_idx=current_acc_idx,
+            duration_sec=time.time() - t_start,
+            is_retry=is_task_retry,
+            parent_task_id=parent_task_id
+        )
 
         # Dynamic Quota Auto-Trigger: When account hits 0 remaining, wait 1 minute & inspect
         should_auto_probe = False
@@ -1372,6 +1447,15 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         print(f"❌ {err}")
         update_firebase_result(slot_id, "FAILED", error=err, account_idx=current_acc_idx)
         update_slot_data(slot_id, {"status": "FAILED"})
+        push_studio_telemetry(
+            task_id=slot_id,
+            status="FAILED",
+            account_idx=current_acc_idx,
+            duration_sec=time.time() - t_start,
+            is_retry=is_task_retry,
+            parent_task_id=parent_task_id,
+            error=err
+        )
         return False
 
 
@@ -1662,6 +1746,13 @@ def process_studio_task(slot_id):
                 "warmedAt": int(time.time() * 1000),
                 "accountIndex": account_idx
             })
+            push_studio_telemetry(
+                task_id=slot_id,
+                status="READY",
+                account_idx=account_idx,
+                duration_sec=time.time() - t_start,
+                is_prewarm=True
+            )
             print(f"🔥 Runner is WARM & READY in {time.time() - t_start:.2f}s! Entering 800ms standby poll loop (180s max)...")
 
             standby_start = time.time()
@@ -1697,6 +1788,14 @@ def process_studio_task(slot_id):
             if not task_received:
                 print(f"⏰ Slot {_mask_task(slot_id)} 180s cloud watchdog expired with no operator input.")
                 update_slot_data(slot_id, {"status": "EXPIRED"})
+                push_studio_telemetry(
+                    task_id=slot_id,
+                    status="EXPIRED",
+                    account_idx=account_idx,
+                    duration_sec=time.time() - t_start,
+                    is_prewarm=True,
+                    error="180s cloud watchdog expired with no operator input"
+                )
                 task_ctx.release_all_locks()
                 browser.close()
                 return
@@ -1714,6 +1813,13 @@ def process_studio_task(slot_id):
             print(f"❌ {err}")
             update_firebase_result(slot_id, "FAILED", error=err, account_idx=task_ctx.active_idx)
             update_slot_data(slot_id, {"status": "FAILED"})
+            push_studio_telemetry(
+                task_id=slot_id,
+                status="FAILED",
+                account_idx=task_ctx.active_idx,
+                duration_sec=time.time() - t_start,
+                error=err
+            )
             task_ctx.release_all_locks()
             browser.close()
             return
