@@ -353,6 +353,9 @@ def update_slot_data(slot_id, updates):
         return False
 
 
+_CURRENT_TASK_START = None
+
+
 def update_firebase_result(task_id, status, image_b64=None, error=None, account_idx=None, switched_from=None, switch_reason=None):
     url = f"{FIREBASE_TASKS_BASE}/{task_id}/result.json"
     report = {
@@ -381,6 +384,32 @@ def update_firebase_result(task_id, status, image_b64=None, error=None, account_
             print(f"📡 Firebase task {_mask_task(task_id)} result updated: {resp.status} ({status})")
     except Exception as e:
         print(f"⚠️ Error updating Firebase result: {_safe_err(e)}")
+
+    # 📊 Universal Persistent Telemetry: Auto-push every result update directly to studio_telemetry
+    try:
+        duration_sec = None
+        global _CURRENT_TASK_START
+        if '_CURRENT_TASK_START' in globals() and _CURRENT_TASK_START:
+            duration_sec = round(time.time() - _CURRENT_TASK_START, 2)
+
+        slot_curr = fetch_slot_data(task_id) or {}
+        is_task_retry = slot_curr.get("isRetry") is True or slot_curr.get("input", {}).get("isRetry") is True
+        is_prewarm = (slot_curr.get("status") == "WARMING") or (not slot_curr.get("input", {}).get("imageBase64") and slot_curr.get("status") != "PENDING")
+        parent_task_id = slot_curr.get("parentTaskId") or slot_curr.get("input", {}).get("parentTaskId")
+        actual_acc_idx = account_idx if account_idx is not None else slot_curr.get("accountIndex")
+
+        push_studio_telemetry(
+            task_id=task_id,
+            status=status,
+            account_idx=actual_acc_idx,
+            duration_sec=duration_sec,
+            is_retry=is_task_retry,
+            is_prewarm=is_prewarm,
+            parent_task_id=parent_task_id,
+            error=error
+        )
+    except Exception as e_tel:
+        print(f"⚠️ Auto-push studio telemetry error: {_safe_err(e_tel)}")
 
 def push_studio_telemetry(task_id, status, account_idx=None, duration_sec=None, is_retry=False, is_prewarm=False, parent_task_id=None, error=None):
     """
@@ -1094,15 +1123,6 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         print(f"❌ {err}")
         update_firebase_result(slot_id, "FAILED", error=err, account_idx=current_acc_idx)
         update_slot_data(slot_id, {"status": "FAILED"})
-        push_studio_telemetry(
-            task_id=slot_id,
-            status="FAILED",
-            account_idx=current_acc_idx,
-            duration_sec=time.time() - t_start,
-            is_retry=is_task_retry,
-            parent_task_id=parent_task_id,
-            error=err
-        )
         return False
 
     print("📤 Uploading portrait to ChatGPT...")
@@ -1122,7 +1142,7 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     except Exception as e:
         err = f"TRANSIENT_TIMEOUT: File input attach timed out ({e})"
         print(f"❌ {err}")
-        update_firebase_result(slot_id, "FAILED", error=err)
+        update_firebase_result(slot_id, "FAILED", error=err, account_idx=current_acc_idx)
         update_slot_data(slot_id, {"status": "FAILED"})
         return False
 
@@ -1139,7 +1159,7 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     if not attached_ok:
         err = "TRANSIENT_TIMEOUT: Image attachment confirmation timed out (aborted to prevent text hallucination)"
         print(f"❌ {err}")
-        update_firebase_result(slot_id, "FAILED", error=err)
+        update_firebase_result(slot_id, "FAILED", error=err, account_idx=current_acc_idx)
         update_slot_data(slot_id, {"status": "FAILED"})
         return False
 
@@ -1351,14 +1371,6 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         except Exception as e_usage:
             print(f"⚠️ Failed to increment account usage: {_safe_err(e_usage)}")
         print(f"🎉 Slot {_mask_task(slot_id)} completed successfully in {time.time() - t_start:.2f}s!")
-        push_studio_telemetry(
-            task_id=slot_id,
-            status="COMPLETED",
-            account_idx=current_acc_idx,
-            duration_sec=time.time() - t_start,
-            is_retry=is_task_retry,
-            parent_task_id=parent_task_id
-        )
 
         # Dynamic Quota Auto-Trigger: When account hits 0 remaining, wait 1 minute & inspect
         should_auto_probe = False
@@ -1447,19 +1459,12 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         print(f"❌ {err}")
         update_firebase_result(slot_id, "FAILED", error=err, account_idx=current_acc_idx)
         update_slot_data(slot_id, {"status": "FAILED"})
-        push_studio_telemetry(
-            task_id=slot_id,
-            status="FAILED",
-            account_idx=current_acc_idx,
-            duration_sec=time.time() - t_start,
-            is_retry=is_task_retry,
-            parent_task_id=parent_task_id,
-            error=err
-        )
         return False
 
 
 def process_studio_task(slot_id):
+    global _CURRENT_TASK_START
+    _CURRENT_TASK_START = time.time()
     from playwright.sync_api import sync_playwright
 
     print(f"\n==================================================")
@@ -1813,13 +1818,6 @@ def process_studio_task(slot_id):
             print(f"❌ {err}")
             update_firebase_result(slot_id, "FAILED", error=err, account_idx=task_ctx.active_idx)
             update_slot_data(slot_id, {"status": "FAILED"})
-            push_studio_telemetry(
-                task_id=slot_id,
-                status="FAILED",
-                account_idx=task_ctx.active_idx,
-                duration_sec=time.time() - t_start,
-                error=err
-            )
             task_ctx.release_all_locks()
             browser.close()
             return
