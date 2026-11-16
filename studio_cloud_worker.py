@@ -518,16 +518,6 @@ def verify_server_device_authorization(device_id):
     if not is_unlimited and not is_trial_active:
         credits = int(dev.get("photoCredits", dev.get("photoBalance", 0)) or 0)
         if credits <= 0:
-            try:
-                patch_req = urllib.request.Request(
-                    dev_url,
-                    data=json.dumps({"enabled": False, "lockReason": "CREDITS_EXHAUSTED"}).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="PATCH"
-                )
-                urllib.request.urlopen(patch_req, timeout=5)
-            except Exception:
-                pass
             return False, "CREDITS_EXHAUSTED: Photo credits balance is 0 on server"
 
     return True, "AUTHORIZED"
@@ -561,9 +551,6 @@ def deduct_server_device_credit(device_id):
         cur_credits = int(dev.get("photoCredits", dev.get("photoBalance", 0)) or 0)
         new_credits = max(0, cur_credits - 1)
         patch_data = {"photoCredits": new_credits}
-        if new_credits <= 0:
-            patch_data["enabled"] = False
-            patch_data["lockReason"] = "CREDITS_EXHAUSTED"
 
         patch_req = urllib.request.Request(
             dev_url,
