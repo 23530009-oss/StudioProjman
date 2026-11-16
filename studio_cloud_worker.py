@@ -397,6 +397,7 @@ def update_firebase_result(task_id, status, image_b64=None, error=None, account_
         is_prewarm = (slot_curr.get("status") == "WARMING") or (not slot_curr.get("input", {}).get("imageBase64") and slot_curr.get("status") != "PENDING")
         parent_task_id = slot_curr.get("parentTaskId") or slot_curr.get("input", {}).get("parentTaskId")
         actual_acc_idx = account_idx if account_idx is not None else slot_curr.get("accountIndex")
+        dev_id = slot_curr.get("deviceId") or slot_curr.get("input", {}).get("deviceId") or ""
 
         push_studio_telemetry(
             task_id=task_id,
@@ -406,12 +407,13 @@ def update_firebase_result(task_id, status, image_b64=None, error=None, account_
             is_retry=is_task_retry,
             is_prewarm=is_prewarm,
             parent_task_id=parent_task_id,
-            error=error
+            error=error,
+            device_id=dev_id
         )
     except Exception as e_tel:
         print(f"⚠️ Auto-push studio telemetry error: {_safe_err(e_tel)}")
 
-def push_studio_telemetry(task_id, status, account_idx=None, duration_sec=None, is_retry=False, is_prewarm=False, parent_task_id=None, error=None):
+def push_studio_telemetry(task_id, status, account_idx=None, duration_sec=None, is_retry=False, is_prewarm=False, parent_task_id=None, error=None, device_id=None):
     """
     Direct Worker-to-Firebase Telemetry Pipeline.
     Writes ~150 bytes of execution metadata directly to studio_telemetry/{task_id}.json.
@@ -426,6 +428,7 @@ def push_studio_telemetry(task_id, status, account_idx=None, duration_sec=None, 
         
         telemetry_data = {
             "taskId": task_id,
+            "deviceId": device_id or None,
             "runId": run_id or None,
             "repo": repo,
             "htmlUrl": html_url,
@@ -1775,7 +1778,11 @@ def process_studio_task(slot_id):
                 if poll_status == "PENDING":
                     poll_slot = fetch_slot_data(slot_id)
                     p_input = poll_slot.get("input", {})
-                    print(f"⚡ FAST PICKUP! Operator submitted photo after {time.time() - standby_start:.1f}s of standby!")
+                    standby_wait = time.time() - standby_start
+                    print(f"⚡ FAST PICKUP! Operator submitted photo after {standby_wait:.1f}s of standby!")
+                    # Adjust t_start so idle operator standby waiting time is deducted from GPU computation time:
+                    t_start = t_start + standby_wait
+                    _CURRENT_TASK_START = t_start
                     prompt = p_input.get("prompt", prompt)
                     img_b64 = p_input.get("imageBase64", "")
                     dress_b64 = p_input.get("dressImageBase64", dress_b64)
@@ -1784,6 +1791,15 @@ def process_studio_task(slot_id):
                     break
                 elif poll_status == "CANCELLED":
                     print(f"⏹️ Slot {_mask_task(slot_id)} was CANCELLED by operator. Exiting cleanly.")
+                    push_studio_telemetry(
+                        task_id=slot_id,
+                        status="CANCELLED",
+                        account_idx=account_idx,
+                        duration_sec=time.time() - t_start,
+                        is_prewarm=True,
+                        device_id=device_id,
+                        error="Cancelled by operator during standby"
+                    )
                     task_ctx.release_all_locks()
                     browser.close()
                     return
