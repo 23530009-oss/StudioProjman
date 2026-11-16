@@ -1759,7 +1759,8 @@ def process_studio_task(slot_id):
                 status="READY",
                 account_idx=account_idx,
                 duration_sec=time.time() - t_start,
-                is_prewarm=True
+                is_prewarm=True,
+                device_id=device_id
             )
             print(f"🔥 Runner is WARM & READY in {time.time() - t_start:.2f}s! Entering 800ms standby poll loop (180s max)...")
 
@@ -1815,6 +1816,7 @@ def process_studio_task(slot_id):
                     account_idx=account_idx,
                     duration_sec=time.time() - t_start,
                     is_prewarm=True,
+                    device_id=device_id,
                     error="180s cloud watchdog expired with no operator input"
                 )
                 task_ctx.release_all_locks()
