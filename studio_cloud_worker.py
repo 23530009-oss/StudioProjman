@@ -6,7 +6,6 @@ import os
 import re
 import sys
 import tempfile
-import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
 
@@ -353,9 +352,6 @@ def update_slot_data(slot_id, updates):
         return False
 
 
-_CURRENT_TASK_START = None
-
-
 def update_firebase_result(task_id, status, image_b64=None, error=None, account_idx=None, switched_from=None, switch_reason=None):
     url = f"{FIREBASE_TASKS_BASE}/{task_id}/result.json"
     report = {
@@ -384,88 +380,6 @@ def update_firebase_result(task_id, status, image_b64=None, error=None, account_
             print(f"📡 Firebase task {_mask_task(task_id)} result updated: {resp.status} ({status})")
     except Exception as e:
         print(f"⚠️ Error updating Firebase result: {_safe_err(e)}")
-
-    # 📊 Universal Persistent Telemetry: Auto-push every result update directly to studio_telemetry
-    try:
-        duration_sec = None
-        global _CURRENT_TASK_START
-        if '_CURRENT_TASK_START' in globals() and _CURRENT_TASK_START:
-            duration_sec = round(time.time() - _CURRENT_TASK_START, 2)
-
-        slot_curr = fetch_slot_data(task_id) or {}
-        is_task_retry = slot_curr.get("isRetry") is True or slot_curr.get("input", {}).get("isRetry") is True
-        is_prewarm = (slot_curr.get("status") == "WARMING") or (not slot_curr.get("input", {}).get("imageBase64") and slot_curr.get("status") != "PENDING")
-        parent_task_id = slot_curr.get("parentTaskId") or slot_curr.get("input", {}).get("parentTaskId")
-        actual_acc_idx = account_idx if account_idx is not None else slot_curr.get("accountIndex")
-        dev_id = slot_curr.get("deviceId") or slot_curr.get("input", {}).get("deviceId") or ""
-
-        push_studio_telemetry(
-            task_id=task_id,
-            status=status,
-            account_idx=actual_acc_idx,
-            duration_sec=duration_sec,
-            is_retry=is_task_retry,
-            is_prewarm=is_prewarm,
-            parent_task_id=parent_task_id,
-            error=error,
-            device_id=dev_id
-        )
-    except Exception as e_tel:
-        print(f"⚠️ Auto-push studio telemetry error: {_safe_err(e_tel)}")
-
-def push_studio_telemetry(task_id, status, account_idx=None, duration_sec=None, is_retry=False, is_prewarm=False, parent_task_id=None, error=None, device_id=None):
-    """
-    Direct Worker-to-Firebase Telemetry Pipeline.
-    Writes ~150 bytes of execution metadata directly to studio_telemetry/{task_id}.json.
-    Eliminates all reverse GitHub Actions scraping, time-window searches, and data redundancy.
-    """
-    if not task_id:
-        return
-    try:
-        run_id = os.environ.get("GITHUB_RUN_ID", "").strip()
-        repo = os.environ.get("GITHUB_REPOSITORY", "23530009-oss/StudioProjman").strip()
-        html_url = f"https://github.com/{repo}/actions/runs/{run_id}" if run_id else f"https://github.com/{repo}/actions"
-        
-        telemetry_data = {
-            "taskId": task_id,
-            "deviceId": device_id or None,
-            "runId": run_id or None,
-            "repo": repo,
-            "htmlUrl": html_url,
-            "accountNumber": (int(account_idx) + 1) if account_idx is not None else None,
-            "status": status,
-            "durationSec": round(float(duration_sec), 2) if duration_sec is not None else None,
-            "isRetry": bool(is_retry),
-            "isPrewarm": bool(is_prewarm),
-            "parentTaskId": parent_task_id or None,
-            "error": _safe_err(error) if error else None,
-            "timestamp": int(time.time() * 1000)
-        }
-        
-        url = f"{FIREBASE_BASE}/studio_telemetry/{urllib.parse.quote(task_id)}.json"
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(telemetry_data).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="PUT"
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            print(f"📊 Studio Telemetry saved for {_mask_task(task_id)}: status={status}, account={telemetry_data['accountNumber']}, duration={telemetry_data['durationSec']}s")
-            
-        # If this attempt has a parent (failover retry or likeness retake), link it on the parent node
-        if parent_task_id:
-            parent_url = f"{FIREBASE_BASE}/studio_telemetry/{urllib.parse.quote(parent_task_id)}.json"
-            patch_data = {"nextAttemptTaskId": task_id}
-            req_p = urllib.request.Request(
-                parent_url,
-                data=json.dumps(patch_data).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="PATCH"
-            )
-            with urllib.request.urlopen(req_p, timeout=10):
-                print(f"🔗 Telemetry parent link saved: {_mask_task(parent_task_id)} -> {_mask_task(task_id)}")
-    except Exception as e:
-        print(f"⚠️ Error saving studio telemetry: {_safe_err(e)}")
 
 def verify_server_device_authorization(device_id):
     """
@@ -518,6 +432,16 @@ def verify_server_device_authorization(device_id):
     if not is_unlimited and not is_trial_active:
         credits = int(dev.get("photoCredits", dev.get("photoBalance", 0)) or 0)
         if credits <= 0:
+            try:
+                patch_req = urllib.request.Request(
+                    dev_url,
+                    data=json.dumps({"enabled": False, "lockReason": "CREDITS_EXHAUSTED"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="PATCH"
+                )
+                urllib.request.urlopen(patch_req, timeout=5)
+            except Exception:
+                pass
             return False, "CREDITS_EXHAUSTED: Photo credits balance is 0 on server"
 
     return True, "AUTHORIZED"
@@ -551,6 +475,9 @@ def deduct_server_device_credit(device_id):
         cur_credits = int(dev.get("photoCredits", dev.get("photoBalance", 0)) or 0)
         new_credits = max(0, cur_credits - 1)
         patch_data = {"photoCredits": new_credits}
+        if new_credits <= 0:
+            patch_data["enabled"] = False
+            patch_data["lockReason"] = "CREDITS_EXHAUSTED"
 
         patch_req = urllib.request.Request(
             dev_url,
@@ -1002,13 +929,9 @@ def check_quota_and_restore_bonus(page, context, account_idx, slot_id=None):
         return False
 
 
-def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_start, device_id="", switched_from=None, switch_reason=None, dress_b64=None):
+def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_start, device_id="", switched_from=None, switch_reason=None):
     task_ctx = account_idx if isinstance(account_idx, TaskExecutionContext) else TaskExecutionContext(account_idx, slot_id)
     current_acc_idx = task_ctx.active_idx
-
-    slot_curr = fetch_slot_data(slot_id) or {}
-    is_task_retry = slot_curr.get("isRetry") is True or slot_curr.get("input", {}).get("isRetry") is True
-    parent_task_id = slot_curr.get("parentTaskId") or slot_curr.get("input", {}).get("parentTaskId")
 
     temp_img_path = None
     if img_b64:
@@ -1019,16 +942,6 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             print(f"💾 Input image saved to: {temp_img_path} ({os.path.getsize(temp_img_path)} bytes)")
         except Exception as e:
             print(f"⚠️ Error saving input image: {e}")
-
-    temp_dress_path = None
-    if dress_b64:
-        try:
-            temp_dress_path = os.path.join(tempfile.gettempdir(), f"{slot_id}_dress.jpg")
-            with open(temp_dress_path, "wb") as f:
-                f.write(base64.b64decode(dress_b64))
-            print(f"👗 Reference attire image saved to: {temp_dress_path} ({os.path.getsize(temp_dress_path)} bytes)")
-        except Exception as e:
-            print(f"⚠️ Error saving reference dress image: {e}")
 
     # Wait for composer
     composer = page.locator(
@@ -1117,22 +1030,13 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
     print("📤 Uploading portrait to ChatGPT...")
     try:
-        # Target multi-file attachment input, excluding single-photo camera inputs (which lack 'multiple')
-        file_input = page.locator('input[type="file"]:not([capture])').first
-        if file_input.count() == 0:
-            file_input = page.locator('input[type="file"]').first
+        file_input = page.locator('input[type="file"]').first
         file_input.wait_for(state="attached", timeout=15000)
-        upload_files = [temp_img_path, temp_dress_path] if temp_dress_path else temp_img_path
-        if temp_dress_path:
-            try:
-                file_input.evaluate("el => el.setAttribute('multiple', '')")
-            except Exception:
-                pass
-        file_input.set_input_files(upload_files)
+        file_input.set_input_files(temp_img_path)
     except Exception as e:
         err = f"TRANSIENT_TIMEOUT: File input attach timed out ({e})"
         print(f"❌ {err}")
-        update_firebase_result(slot_id, "FAILED", error=err, account_idx=current_acc_idx)
+        update_firebase_result(slot_id, "FAILED", error=err)
         update_slot_data(slot_id, {"status": "FAILED"})
         return False
 
@@ -1149,7 +1053,7 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     if not attached_ok:
         err = "TRANSIENT_TIMEOUT: Image attachment confirmation timed out (aborted to prevent text hallucination)"
         print(f"❌ {err}")
-        update_firebase_result(slot_id, "FAILED", error=err, account_idx=current_acc_idx)
+        update_firebase_result(slot_id, "FAILED", error=err)
         update_slot_data(slot_id, {"status": "FAILED"})
         return False
 
@@ -1319,17 +1223,8 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         update_slot_data(slot_id, slot_patch)
         sync_fresh_cookies(page.context, current_acc_idx)
         # 💳 SERVER-LEVEL CREDIT DEDUCTION: Authoritative server-side wallet balance decrement
-        is_task_retry = False
-        try:
-            slot_curr = fetch_slot_data(slot_id) or {}
-            is_task_retry = slot_curr.get("isRetry") is True or slot_curr.get("input", {}).get("isRetry") is True
-        except Exception:
-            pass
-
-        if device_id and not is_task_retry:
+        if device_id:
             deduct_server_device_credit(device_id)
-        elif is_task_retry:
-            print(f"🔄 ZERO-CREDIT RETRY: Bypassing credit deduction for Device {_mask_device(device_id)} (Task: {_mask_task(slot_id)})")
 
         # 📊 Increment Account Pool Usage & Update Quota Day
         try:
@@ -1427,8 +1322,7 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
                         page, slot_id, task_ctx, prompt, img_b64, t_start,
                         device_id=device_id,
                         switched_from=switched_from,
-                        switch_reason=switch_reason,
-                        dress_b64=dress_b64
+                        switch_reason=switch_reason
                     )
                 except Exception as ex_swap:
                     print(f"⚠️ In-flight swap re-execution failed on Account #{new_idx+1}: {_safe_err(ex_swap)}")
@@ -1453,8 +1347,6 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
 
 
 def process_studio_task(slot_id):
-    global _CURRENT_TASK_START
-    _CURRENT_TASK_START = time.time()
     from playwright.sync_api import sync_playwright
 
     print(f"\n==================================================")
@@ -1595,7 +1487,6 @@ def process_studio_task(slot_id):
 
     initial_status = slot_data.get("status") or input_data.get("status", "PENDING")
     img_b64 = input_data.get("imageBase64", "")
-    dress_b64 = input_data.get("dressImageBase64") or None
     prompt = input_data.get("prompt", "Professional passport photo portrait")
 
     is_prewarm = (initial_status == "WARMING") or (not img_b64 and initial_status != "PENDING" and not is_quota_probe)
@@ -1741,14 +1632,6 @@ def process_studio_task(slot_id):
                 "warmedAt": int(time.time() * 1000),
                 "accountIndex": account_idx
             })
-            push_studio_telemetry(
-                task_id=slot_id,
-                status="READY",
-                account_idx=account_idx,
-                duration_sec=time.time() - t_start,
-                is_prewarm=True,
-                device_id=device_id
-            )
             print(f"🔥 Runner is WARM & READY in {time.time() - t_start:.2f}s! Entering 800ms standby poll loop (180s max)...")
 
             standby_start = time.time()
@@ -1766,28 +1649,14 @@ def process_studio_task(slot_id):
                 if poll_status == "PENDING":
                     poll_slot = fetch_slot_data(slot_id)
                     p_input = poll_slot.get("input", {})
-                    standby_wait = time.time() - standby_start
-                    print(f"⚡ FAST PICKUP! Operator submitted photo after {standby_wait:.1f}s of standby!")
-                    # Adjust t_start so idle operator standby waiting time is deducted from GPU computation time:
-                    t_start = t_start + standby_wait
-                    _CURRENT_TASK_START = t_start
+                    print(f"⚡ FAST PICKUP! Operator submitted photo after {time.time() - standby_start:.1f}s of standby!")
                     prompt = p_input.get("prompt", prompt)
                     img_b64 = p_input.get("imageBase64", "")
-                    dress_b64 = p_input.get("dressImageBase64", dress_b64)
                     update_slot_data(slot_id, {"status": "PROCESSING"})
                     task_received = True
                     break
                 elif poll_status == "CANCELLED":
                     print(f"⏹️ Slot {_mask_task(slot_id)} was CANCELLED by operator. Exiting cleanly.")
-                    push_studio_telemetry(
-                        task_id=slot_id,
-                        status="CANCELLED",
-                        account_idx=account_idx,
-                        duration_sec=time.time() - t_start,
-                        is_prewarm=True,
-                        device_id=device_id,
-                        error="Cancelled by operator during standby"
-                    )
                     task_ctx.release_all_locks()
                     browser.close()
                     return
@@ -1797,15 +1666,6 @@ def process_studio_task(slot_id):
             if not task_received:
                 print(f"⏰ Slot {_mask_task(slot_id)} 180s cloud watchdog expired with no operator input.")
                 update_slot_data(slot_id, {"status": "EXPIRED"})
-                push_studio_telemetry(
-                    task_id=slot_id,
-                    status="EXPIRED",
-                    account_idx=account_idx,
-                    duration_sec=time.time() - t_start,
-                    is_prewarm=True,
-                    device_id=device_id,
-                    error="180s cloud watchdog expired with no operator input"
-                )
                 task_ctx.release_all_locks()
                 browser.close()
                 return
@@ -1814,7 +1674,6 @@ def process_studio_task(slot_id):
             print(f"⚡ FAST-CLICK / DIRECT RUN: Processing task immediately (boot elapsed: {time.time() - t_start:.2f}s)!")
             prompt = current_input.get("prompt", prompt)
             img_b64 = current_input.get("imageBase64", img_b64)
-            dress_b64 = current_input.get("dressImageBase64", dress_b64)
             update_slot_data(slot_id, {"status": "PROCESSING"})
 
         # Fail-fast guard: Real photo jobs require imageBase64 input
@@ -1833,8 +1692,7 @@ def process_studio_task(slot_id):
                 page, slot_id, task_ctx, prompt, img_b64, t_start,
                 device_id=device_id,
                 switched_from=switched_from,
-                switch_reason=switch_reason,
-                dress_b64=dress_b64
+                switch_reason=switch_reason
             )
         finally:
             task_ctx.release_all_locks()
