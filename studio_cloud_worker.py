@@ -866,6 +866,40 @@ def check_login_or_auth_expired(page):
     return None
 
 
+def build_dynamic_user_agent(browser):
+    """Builds a fingerprint-consistent User-Agent matching the live Chromium version & OS."""
+    try:
+        ver = (browser.version or "").strip()
+    except Exception:
+        ver = ""
+    if not ver or not re.match(r"^\d+\.\d+", ver):
+        ver = "136.0.0.0"
+    if sys.platform.startswith("win"):
+        platform_token = "Windows NT 10.0; Win64; x64"
+    elif sys.platform == "darwin":
+        platform_token = "Macintosh; Intel Mac OS X 10_15_7"
+    else:
+        platform_token = "X11; Linux x86_64"
+    return f"Mozilla/5.0 ({platform_token}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36"
+
+
+def detect_cloudflare_challenge(page):
+    """Detects Cloudflare Turnstile / 'Just a moment...' bot gates for instant fail-fast."""
+    try:
+        title = (page.title() or "").strip().lower()
+        if "just a moment" in title or "attention required" in title:
+            return f"Cloudflare challenge title: '{title}'"
+        cf_loc = page.locator(
+            '#challenge-running, #cf-turnstile, iframe[src*="challenges.cloudflare.com"], '
+            'iframe[src*="challenge-platform"], div.cf-browser-verification'
+        ).first
+        if cf_loc.count() > 0:
+            return "Cloudflare Turnstile / challenge DOM detected"
+    except Exception:
+        pass
+    return None
+
+
 def check_quota_and_restore_bonus(page, context, account_idx, slot_id=None):
     """
     Unified Quota Inspector & Fresh Cookie Refresher:
@@ -1033,18 +1067,40 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     # Wait for composer
     composer = page.locator(
         "#prompt-textarea:not(.wcDTda_fallbackTextarea):visible, "
+        "#mobile-composer-prompt:visible, "
+        "textarea[name='prompt']:visible, "
         "div[contenteditable='true']:visible, "
         "textarea:not(.wcDTda_fallbackTextarea):visible"
     ).first
 
+    cf_err = detect_cloudflare_challenge(page)
+    if cf_err:
+        err = f"TRANSIENT_TIMEOUT: CLOUDFLARE_CHALLENGE_BLOCKED on Account #{int(current_acc_idx)+1} ({cf_err})"
+        print(f"🛡️ {err} — Failing fast so app can retry on a clean runner IP.")
+        atomic_unlock_account(current_acc_idx, slot_id)
+        task_ctx.record_unlocked(current_acc_idx)
+        update_firebase_result(slot_id, "FAILED", error=err, account_idx=current_acc_idx)
+        update_slot_data(slot_id, {"status": "FAILED"})
+        return False
+
     composer_ready = False
     try:
-        composer.wait_for(state="visible", timeout=30000)
+        composer.wait_for(state="visible", timeout=22000)
         composer_ready = True
     except Exception:
         pass
 
     if not composer_ready:
+        cf_err = detect_cloudflare_challenge(page)
+        if cf_err:
+            err = f"TRANSIENT_TIMEOUT: CLOUDFLARE_CHALLENGE_BLOCKED on Account #{int(current_acc_idx)+1} ({cf_err})"
+            print(f"🛡️ {err} — Skipping useless hot-swap on blocked VM.")
+            atomic_unlock_account(current_acc_idx, slot_id)
+            task_ctx.record_unlocked(current_acc_idx)
+            update_firebase_result(slot_id, "FAILED", error=err, account_idx=current_acc_idx)
+            update_slot_data(slot_id, {"status": "FAILED"})
+            return False
+
         auth_err = check_login_or_auth_expired(page)
         old_idx = current_acc_idx
         if auth_err:
@@ -1082,6 +1138,8 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
                         btn.click(timeout=1000)
                 composer = page.locator(
                     "#prompt-textarea:not(.wcDTda_fallbackTextarea):visible, "
+                    "#mobile-composer-prompt:visible, "
+                    "textarea[name='prompt']:visible, "
                     "div[contenteditable='true']:visible, "
                     "textarea:not(.wcDTda_fallbackTextarea):visible"
                 ).first
@@ -1115,36 +1173,82 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
         update_slot_data(slot_id, {"status": "FAILED"})
         return False
 
-    print("📤 Uploading portrait to ChatGPT...")
-    try:
-        # Target multi-file attachment input, excluding single-photo camera inputs (which lack 'multiple')
-        file_input = page.locator('input[type="file"]:not([capture])').first
-        if file_input.count() == 0:
-            file_input = page.locator('input[type="file"]').first
-        file_input.wait_for(state="attached", timeout=15000)
-        upload_files = [temp_img_path, temp_dress_path] if temp_dress_path else temp_img_path
-        if temp_dress_path:
+    upload_files = [temp_img_path, temp_dress_path] if temp_dress_path else temp_img_path
+    attach_sel = (
+        'button[aria-label*="Remove" i], '
+        'div[data-testid*="attachment"], '
+        'div[class*="attachment"], '
+        '[data-testid*="file-preview"], '
+        'form img[src^="blob:"], '
+        'form img[src*="oaiusercontent"], '
+        'div[class*="composer"] img, '
+        '[class*="thumbnail"], '
+        '[data-testid*="image"]'
+    )
+
+    attached_ok = False
+    for upload_attempt in (1, 2):
+        if upload_attempt == 2:
+            print("⚠️ Attachment preview missed on Attempt 1. Executing 1x fast page reload & re-upload recovery...")
             try:
-                file_input.evaluate("el => el.setAttribute('multiple', '')")
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+                time.sleep(1.5)
+                if detect_cloudflare_challenge(page):
+                    break
+                for btn_text in ["Stay logged out", "Dismiss", "Close", "Not now", "Got it", "Maybe later", "Okay", "Continue"]:
+                    btn = page.locator(f'button:has-text("{btn_text}")').first
+                    if btn.count() > 0 and btn.is_visible():
+                        btn.click(timeout=1000)
+                composer = page.locator(
+                    "#prompt-textarea:not(.wcDTda_fallbackTextarea):visible, "
+                    "#mobile-composer-prompt:visible, "
+                    "textarea[name='prompt']:visible, "
+                    "div[contenteditable='true']:visible, "
+                    "textarea:not(.wcDTda_fallbackTextarea):visible"
+                ).first
+                composer.wait_for(state="visible", timeout=20000)
+            except Exception as e_rel:
+                print(f"⚠️ Upload recovery reload failed: {e_rel}")
+                break
+
+        print(f"📤 Uploading portrait to ChatGPT (Attempt {upload_attempt}/2)...")
+        try:
+            try:
+                composer.click(timeout=2000)
             except Exception:
                 pass
-        file_input.set_input_files(upload_files)
-    except Exception as e:
-        err = f"TRANSIENT_TIMEOUT: File input attach timed out ({e})"
-        print(f"❌ {err}")
-        update_firebase_result(slot_id, "FAILED", error=err, account_idx=current_acc_idx)
-        update_slot_data(slot_id, {"status": "FAILED"})
-        return False
+            file_input = page.locator('input[type="file"]:not([capture])').first
+            if file_input.count() == 0:
+                file_input = page.locator('input[type="file"]').first
+            file_input.wait_for(state="attached", timeout=12000)
+            if temp_dress_path:
+                try:
+                    file_input.evaluate("el => el.setAttribute('multiple', '')")
+                except Exception:
+                    pass
+            file_input.set_input_files(upload_files)
+        except Exception as e:
+            if upload_attempt == 2:
+                err = f"TRANSIENT_TIMEOUT: File input attach timed out ({e})"
+                print(f"❌ {err}")
+                update_firebase_result(slot_id, "FAILED", error=err, account_idx=current_acc_idx)
+                update_slot_data(slot_id, {"status": "FAILED"})
+                return False
+            continue
 
-    # Ensure image attachment preview appears
-    attached_ok = False
-    for _ in range(40):
-        attach_preview = page.locator('div[data-testid*="attachment"], div[class*="attachment"], button[aria-label*="Remove"], [class*="thumbnail"], [data-testid*="image"]')
-        if attach_preview.count() > 0 and any(attach_preview.nth(i).is_visible() for i in range(attach_preview.count())):
-            attached_ok = True
-            photo_uploaded = True
+        # Attempt 1 waits 12s (fast recovery if React drops event); Attempt 2 waits 18s
+        max_loops = 24 if upload_attempt == 1 else 36
+        for _ in range(max_loops):
+            attach_preview = page.locator(attach_sel)
+            cnt = attach_preview.count()
+            if cnt > 0 and any(attach_preview.nth(i).is_visible() for i in range(cnt)):
+                attached_ok = True
+                photo_uploaded = True
+                break
+            time.sleep(0.5)
+
+        if attached_ok:
             break
-        time.sleep(0.4)
 
     if not attached_ok:
         err = "TRANSIENT_TIMEOUT: Image attachment confirmation timed out (aborted to prevent text hallucination)"
@@ -1161,9 +1265,14 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
     time.sleep(0.5)
 
     # Wait for Send button to become enabled after file upload completes
-    send_btn = page.locator('button[data-testid="send-button"]').first
+    send_btn = page.locator(
+        'button[data-testid="send-button"], '
+        'button#composer-submit-button, '
+        'button[aria-label*="Send prompt" i], '
+        'button[aria-label*="Send message" i]'
+    ).first
     try:
-        send_btn.wait_for(state="visible", timeout=8000)
+        send_btn.wait_for(state="visible", timeout=3000)
         for _ in range(25):
             if send_btn.is_enabled():
                 break
@@ -1174,13 +1283,39 @@ def execute_chatgpt_generation(page, slot_id, account_idx, prompt, img_b64, t_st
             prompt_sent = True
             print("🚀 Send button clicked.")
         else:
+            composer.focus()
             page.keyboard.press("Enter")
             prompt_sent = True
             print("🚀 Pressed Enter.")
     except Exception:
+        try:
+            composer.focus()
+        except Exception:
+            pass
         page.keyboard.press("Enter")
         prompt_sent = True
         print("🚀 Pressed Enter after button timeout.")
+
+    # Verify active submission within 5s so prompts never silently fail into a 90s hang
+    submit_confirmed = False
+    for _ in range(10):
+        stop_loc = page.locator('button[data-testid="stop-button"], button[aria-label*="Stop" i]')
+        user_msg = page.locator('div[data-message-author-role="user"]')
+        if stop_loc.count() > 0 or user_msg.count() > 0:
+            submit_confirmed = True
+            break
+        time.sleep(0.5)
+
+    if not submit_confirmed:
+        print("⚠️ Submission not confirmed in DOM after 5s — refocusing composer and re-submitting...")
+        try:
+            if send_btn.count() > 0 and send_btn.is_visible() and send_btn.is_enabled():
+                send_btn.click(force=True, timeout=2000)
+            else:
+                composer.click(timeout=2000)
+                page.keyboard.press("Enter")
+        except Exception:
+            pass
 
     # Wait for result
     print("⏳ Waiting for ChatGPT to generate result (up to 90s)...")
@@ -1601,7 +1736,8 @@ def process_studio_task(slot_id):
     is_prewarm = (initial_status == "WARMING") or (not img_b64 and initial_status != "PENDING" and not is_quota_probe)
     t_start = time.time()
 
-    with sync_playwright() as p:
+    try:
+      with sync_playwright() as p:
         browser = p.chromium.launch(
             channel="chrome",
             headless=True,
@@ -1613,8 +1749,9 @@ def process_studio_task(slot_id):
                 "--window-size=1280,850"
             ]
         )
+        dynamic_ua = build_dynamic_user_agent(browser)
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            user_agent=dynamic_ua,
             viewport={"width": 1280, "height": 850},
             device_scale_factor=1,
             locale="en-US",
@@ -1682,11 +1819,14 @@ def process_studio_task(slot_id):
 
             # Atomic Self-Healing: pick next eligible account
             old_idx = account_idx
+            task_ctx.record_unlocked(old_idx)
             new_idx, new_cookie = find_and_lock_next_account(slot_id, exclude_indices=[account_idx], device_id=device_id)
             if new_idx is not None and new_cookie:
                 switched_from = old_idx
                 switch_reason = "Redirected"
                 account_idx = new_idx
+                task_ctx.active_idx = new_idx
+                task_ctx.record_locked(new_idx)
                 update_slot_data(slot_id, {
                     "accountIndex": account_idx,
                     "switchedFrom": switched_from,
@@ -1735,6 +1875,43 @@ def process_studio_task(slot_id):
         has_input = bool(current_input.get("imageBase64"))
 
         if is_prewarm and not has_input and current_status != "PENDING":
+            # 🛡️ Real Pre-Warm verification: Make sure ChatGPT didn't hit Cloudflare or a blank page before advertising READY!
+            cf_err = detect_cloudflare_challenge(page)
+            if cf_err:
+                err = f"TRANSIENT_TIMEOUT: Pre-warm blocked by Cloudflare on Account #{account_idx + 1}"
+                print(f"🛡️ {err}")
+                atomic_unlock_account(account_idx, slot_id)
+                task_ctx.record_unlocked(account_idx)
+                update_firebase_result(slot_id, "FAILED", error=err, account_idx=account_idx)
+                update_slot_data(slot_id, {"status": "FAILED"})
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                return
+
+            try:
+                prewarm_composer = page.locator(
+                    "#prompt-textarea:not(.wcDTda_fallbackTextarea):visible, "
+                    "#mobile-composer-prompt:visible, "
+                    "textarea[name='prompt']:visible, "
+                    "div[contenteditable='true']:visible, "
+                    "textarea:not(.wcDTda_fallbackTextarea):visible"
+                ).first
+                prewarm_composer.wait_for(state="visible", timeout=20000)
+            except Exception as e_pw:
+                err = f"TRANSIENT_TIMEOUT: Pre-warm composer not ready in 20s ({e_pw})"
+                print(f"⚠️ {err}")
+                atomic_unlock_account(account_idx, slot_id)
+                task_ctx.record_unlocked(account_idx)
+                update_firebase_result(slot_id, "FAILED", error=err, account_idx=account_idx)
+                update_slot_data(slot_id, {"status": "FAILED"})
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                return
+
             # 🟢 WARM & READY: Signal to Android app that VM is sitting hot in composer!
             update_slot_data(slot_id, {
                 "status": "READY",
@@ -1766,6 +1943,13 @@ def process_studio_task(slot_id):
                 if poll_status == "PENDING":
                     poll_slot = fetch_slot_data(slot_id)
                     p_input = poll_slot.get("input", {})
+                    # If imageBase64 is still propagating in Firebase write, wait up to 3s
+                    for _prop in range(6):
+                        if p_input.get("imageBase64"):
+                            break
+                        time.sleep(0.5)
+                        poll_slot = fetch_slot_data(slot_id)
+                        p_input = poll_slot.get("input", {})
                     standby_wait = time.time() - standby_start
                     print(f"⚡ FAST PICKUP! Operator submitted photo after {standby_wait:.1f}s of standby!")
                     # Adjust t_start so idle operator standby waiting time is deducted from GPU computation time:
@@ -1818,7 +2002,7 @@ def process_studio_task(slot_id):
             update_slot_data(slot_id, {"status": "PROCESSING"})
 
         # Fail-fast guard: Real photo jobs require imageBase64 input
-        if not is_quota_probe and not is_prewarm and not img_b64:
+        if not is_quota_probe and not img_b64:
             err = "FAILED: No photo attached in task payload (aborted to prevent text hallucination)"
             print(f"❌ {err}")
             update_firebase_result(slot_id, "FAILED", error=err, account_idx=task_ctx.active_idx)
@@ -1838,7 +2022,12 @@ def process_studio_task(slot_id):
             )
         finally:
             task_ctx.release_all_locks()
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                pass
+    finally:
+        task_ctx.release_all_locks()
 
 
 def verify_and_introspect_selectors(page):
@@ -2130,8 +2319,9 @@ def run_nightly_maintenance():
             context = None
             try:
                 raw_cookie = get_active_cookie(idx)
+                dynamic_ua = build_dynamic_user_agent(browser)
                 context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    user_agent=dynamic_ua,
                     viewport={"width": 1280, "height": 850},
                     device_scale_factor=1,
                     locale="en-US",
