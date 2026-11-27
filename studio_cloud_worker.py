@@ -2168,6 +2168,20 @@ def process_runner_task(slot_id):
                         p_input = poll_slot.get("input", {})
                     standby_wait = time.time() - standby_start
                     print(f"⚡ Pickup after {standby_wait:.1f}s standby")
+                    auth_ok, auth_err = verify_server_device_authorization(
+                        device_id,
+                        slot_id=slot_id,
+                        is_retry=bool(poll_slot.get("isRetry") is True or p_input.get("isRetry") is True),
+                        parent_task_id=poll_slot.get("parentTaskId") or p_input.get("parentTaskId"),
+                    )
+                    if not auth_ok:
+                        err = f"SERVER_AUTH_REJECTED: {auth_err}"
+                        print(f"🛑 {err} on warm pickup {_mask_task(slot_id)} (Device: '{_mask_device(device_id)}').")
+                        task_ctx.release_all_locks()
+                        update_task_result(slot_id, "FAILED", error=err)
+                        update_slot_data(slot_id, {"status": "FAILED", "error": err})
+                        _close_browser_with_shot(page, browser, slot_id, task_ctx.active_idx, shot_guard)
+                        return
                     t_start = t_start + standby_wait
                     _CURRENT_TASK_START = t_start
                     prompt = p_input.get("prompt", prompt)
@@ -2431,6 +2445,8 @@ def cleanup_stale_tasks(max_age_hours=12):
                 return 0
 
             for task_id in tasks.keys():
+                if not str(task_id).startswith(("task_", "warm_", "probe_", "maint_")):
+                    continue
                 created_at = None
                 parts = task_id.split("_")
                 if len(parts) >= 2 and parts[1].isdigit():
@@ -2801,14 +2817,28 @@ def run_scheduled_maintenance():
         today_str = get_studio_day_string()
         saved_limit = get_max_images_per_account(default=3)
 
+        live_status_map = {}
+        try:
+            with urllib.request.urlopen(urllib.request.Request(f"{STORE_STATUS_BASE}.json", headers={"User-Agent": _UA}), timeout=6) as r_ls:
+                live_status_map = json.loads(r_ls.read().decode("utf-8")) or {}
+        except Exception:
+            live_status_map = {}
+
+        now_rst_ms = int(time.time() * 1000)
         pool_patch = {"maxImagesPerAccount": saved_limit}
         for i in range(total):
+            acc_cur = live_status_map.get(f"acc_{i}", {}) if isinstance(live_status_map, dict) else {}
+            cur_by = str(acc_cur.get("bookedBy") or "")
+            cur_until = int(acc_cur.get("bookedUntil") or 0)
+            has_live_job = bool(cur_by and cur_by != "nightly_maintenance" and cur_until > now_rst_ms)
+
             pool_patch[f"acc_{i}/usage"] = 0
             pool_patch[f"acc_{i}/quotaDay"] = today_str
             pool_patch[f"acc_{i}/resetTime"] = ""
-            pool_patch[f"acc_{i}/isBusy"] = False
-            pool_patch[f"acc_{i}/bookedBy"] = ""
-            pool_patch[f"acc_{i}/bookedUntil"] = 0
+            if not has_live_job:
+                pool_patch[f"acc_{i}/isBusy"] = False
+                pool_patch[f"acc_{i}/bookedBy"] = ""
+                pool_patch[f"acc_{i}/bookedUntil"] = 0
         if pool_patch:
             req_rst = urllib.request.Request(
                 f"{STORE_STATUS_BASE}.json",
