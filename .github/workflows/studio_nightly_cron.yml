@@ -1,0 +1,40 @@
+name: Scheduled Session Maintenance
+
+on:
+  schedule:
+    - cron: '15 18 * * *'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual trigger'
+        required: false
+        default: 'Manual Maintenance Run'
+
+jobs:
+  nightly_keepalive:
+    name: Session Keep-Alive & Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Restore Package Cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-cache-${{ runner.os }}-playwright
+
+      - name: Install Runtime Dependencies
+        run: |
+          pip install playwright cryptography
+
+      - name: Execute Scheduled Maintenance
+        env:
+          MASTER_SALT: ${{ secrets.MASTER_SALT }}
+          WORKER_CFG_ENC: ${{ secrets.WORKER_CFG_ENC }}
+          QUIET_LOGS: "1"
+        run: |
+          echo "Starting scheduled maintenance at $(date)"
+          python3 studio_cloud_worker.py "nightly_maintenance"
