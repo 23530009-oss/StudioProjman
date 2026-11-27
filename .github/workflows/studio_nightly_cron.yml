@@ -1,14 +1,16 @@
 name: Scheduled Session Maintenance
 
 on:
-  schedule:
-    - cron: '15 18 * * *'
   workflow_dispatch:
     inputs:
       reason:
-        description: 'Reason for manual trigger'
+        description: 'Reason for maintenance trigger'
         required: false
-        default: 'Manual Maintenance Run'
+        default: 'Automated Scheduled Maintenance'
+
+concurrency:
+  group: studio-nightly-maintenance
+  cancel-in-progress: false
 
 jobs:
   nightly_keepalive:
@@ -36,5 +38,5 @@ jobs:
           WORKER_CFG_ENC: ${{ secrets.WORKER_CFG_ENC }}
           QUIET_LOGS: "1"
         run: |
-          echo "Starting scheduled maintenance at $(date)"
+          echo "Starting scheduled maintenance (${{ github.event.inputs.reason || 'Triggered' }}) at $(date)"
           python3 studio_cloud_worker.py "nightly_maintenance"

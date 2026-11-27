@@ -512,7 +512,7 @@ def update_task_result(task_id, status, image_b64=None, error=None, account_idx=
         _log(f"⚠️ Telemetry push note: {_safe_err(e_tel)}", verbose=True)
 
 
-def push_run_telemetry(task_id, status, account_idx=None, duration_sec=None, is_retry=False, is_prewarm=False, parent_task_id=None, error=None, device_id=None, had_customer_input=None):
+def push_run_telemetry(task_id, status, account_idx=None, duration_sec=None, is_retry=False, is_prewarm=False, parent_task_id=None, error=None, device_id=None, had_customer_input=None, is_maintenance=False):
     """Writes execution metadata to telemetry store."""
     if not task_id:
         return
@@ -533,7 +533,8 @@ def push_run_telemetry(task_id, status, account_idx=None, duration_sec=None, is_
             "durationSec": round(float(duration_sec), 2) if duration_sec is not None else None,
             "isRetry": bool(is_retry),
             "isPrewarm": bool(is_prewarm),
-            "hadCustomerInput": bool(had_customer_input) if had_customer_input is not None else (not bool(is_prewarm)),
+            "isMaintenance": True if is_maintenance else None,
+            "hadCustomerInput": bool(had_customer_input) if had_customer_input is not None else (not bool(is_prewarm) and not bool(is_maintenance)),
             "parentTaskId": parent_task_id or None,
             "error": _safe_err(error) if error else None,
             "timestamp": int(time.time() * 1000)
@@ -2500,6 +2501,7 @@ def run_scheduled_maintenance():
 
     accounts = get_decrypted_pool()
     total = len(accounts)
+    run_ts = int(time.time() * 1000)
     active_count = 0
     refreshed_count = 0
     expired_count = 0
@@ -2555,6 +2557,9 @@ def run_scheduled_maintenance():
                 pass
 
             context = None
+            page = None
+            acc_start = time.time()
+            maint_tid = f"maint_{run_ts}_a{idx + 1:02d}"
             try:
                 raw_cookie = get_active_session_blob(idx)
                 dynamic_ua = build_dynamic_user_agent(browser)
@@ -2660,10 +2665,34 @@ def run_scheduled_maintenance():
                 if state == "GATE_BLOCKED":
                     print(f"🛡️ Account #{idx+1} [GATE_BLK] ({detail})")
                     cf_blocked_count += 1
+                    capture_and_upload_final_screenshot(page, maint_tid, outcome_hint="MAINT_BLOCKED", account_idx=idx)
+                    push_run_telemetry(
+                        task_id=maint_tid,
+                        status="MAINT_BLOCKED",
+                        account_idx=idx,
+                        duration_sec=time.time() - acc_start,
+                        is_retry=is_retry,
+                        is_prewarm=False,
+                        error=detail,
+                        had_customer_input=False,
+                        is_maintenance=True,
+                    )
                 elif state == "EXPIRED":
                     print(f"❌ Account #{idx+1} [EXPIRED] ({detail})")
+                    capture_and_upload_final_screenshot(page, maint_tid, outcome_hint="MAINT_EXPIRED", account_idx=idx)
                     mark_account_expired(idx)
                     expired_count += 1
+                    push_run_telemetry(
+                        task_id=maint_tid,
+                        status="MAINT_EXPIRED",
+                        account_idx=idx,
+                        duration_sec=time.time() - acc_start,
+                        is_retry=is_retry,
+                        is_prewarm=False,
+                        error=detail,
+                        had_customer_input=False,
+                        is_maintenance=True,
+                    )
                 else:
                     active_count += 1
                     for btn_text in _CFG.get("popups", []):
@@ -2697,10 +2726,36 @@ def run_scheduled_maintenance():
                         except Exception as e_sel:
                             _log(f"⚠️ Selector note: {_safe_err(e_sel)}", verbose=True)
 
+                    capture_and_upload_final_screenshot(page, maint_tid, outcome_hint="MAINT_OK", account_idx=idx)
+                    push_run_telemetry(
+                        task_id=maint_tid,
+                        status="MAINT_OK",
+                        account_idx=idx,
+                        duration_sec=time.time() - acc_start,
+                        is_retry=is_retry,
+                        is_prewarm=False,
+                        error=None,
+                        had_customer_input=False,
+                        is_maintenance=True,
+                    )
                     print(f"✅ Account #{idx+1} [AUTH_OK]")
                 return "DONE"
             except Exception as e_acc:
-                print(f"⚠️ Maintenance error on Account #{idx+1}: {_safe_err(e_acc)}")
+                safe_msg = _safe_err(e_acc)
+                print(f"⚠️ Maintenance error on Account #{idx+1}: {safe_msg}")
+                if page:
+                    capture_and_upload_final_screenshot(page, maint_tid, outcome_hint="MAINT_ERROR", account_idx=idx)
+                push_run_telemetry(
+                    task_id=maint_tid,
+                    status="MAINT_ERROR",
+                    account_idx=idx,
+                    duration_sec=time.time() - acc_start,
+                    is_retry=is_retry,
+                    is_prewarm=False,
+                    error=safe_msg,
+                    had_customer_input=False,
+                    is_maintenance=True,
+                )
                 return "ERROR"
             finally:
                 if lock_acquired:
